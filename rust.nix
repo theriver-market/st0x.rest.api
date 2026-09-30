@@ -1,4 +1,8 @@
-{ pkgs, craneLib, sqlx-cli }:
+{
+  pkgs,
+  craneLib,
+  sqlx-cli,
+}:
 
 let
   libDir = builtins.path {
@@ -8,9 +12,12 @@ let
 
   depsSrc = pkgs.lib.cleanSourceWith {
     src = ./.;
-    filter = path: type:
-      let base = builtins.baseNameOf path;
-      in type == "directory" || base == "Cargo.toml" || base == "Cargo.lock";
+    filter =
+      path: type:
+      let
+        base = builtins.baseNameOf path;
+      in
+      type == "directory" || base == "Cargo.toml" || base == "Cargo.lock";
   };
 
   cargoVendorDir = craneLib.vendorCargoDeps {
@@ -25,11 +32,17 @@ let
 
     inherit cargoVendorDir;
 
-    nativeBuildInputs = [ sqlx-cli pkgs.pkg-config pkgs.curl ];
+    nativeBuildInputs = [
+      sqlx-cli
+      pkgs.pkg-config
+      pkgs.curl
+    ];
 
-    buildInputs = [ pkgs.openssl pkgs.sqlite ]
-      ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
-      [ pkgs.apple-sdk_15 ];
+    buildInputs = [
+      pkgs.openssl
+      pkgs.sqlite
+    ]
+    ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.apple-sdk_15 ];
 
     COMMIT_SHA = builtins.getEnv "COMMIT_SHA";
 
@@ -49,21 +62,33 @@ let
     sqlx migrate run --source migrations
   '';
 
-in {
-  package = craneLib.buildPackage (commonArgs // {
-    inherit cargoArtifacts;
-    preBuild = sqlxSetup;
-    doCheck = true;
+in
+{
+  package = craneLib.buildPackage (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      preBuild = sqlxSetup;
+      doCheck = true;
+      # The build sandbox has no system CA store; reqwest's client builder panics
+      # without one even for tests that only talk to local mocks.
+      preCheck = ''
+        export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+      '';
 
-    meta = {
-      description = "st0x REST API server";
-      homepage = "https://github.com/ST0x-Technology/st0x-rest-api";
-    };
-  });
+      meta = {
+        description = "st0x REST API server";
+        homepage = "https://github.com/ST0x-Technology/st0x-rest-api";
+      };
+    }
+  );
 
-  clippy = craneLib.cargoClippy (commonArgs // {
-    inherit cargoArtifacts;
-    preBuild = sqlxSetup;
-    cargoClippyExtraArgs = "--all-targets --all-features -- -D clippy::all";
-  });
+  clippy = craneLib.cargoClippy (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      preBuild = sqlxSetup;
+      cargoClippyExtraArgs = "--all-targets --all-features -- -D clippy::all";
+    }
+  );
 }
