@@ -1,3 +1,4 @@
 [submodule "lib/rain.orderbook"]
 	path = lib/rain.orderbook
-	url = https://github.com/rainlanguage/rain.orderbook.git
+	url = https://github.com/theriver-market/raindex.git
+	branch = river/skip-taker-checks

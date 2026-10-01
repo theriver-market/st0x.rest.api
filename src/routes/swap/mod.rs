@@ -36,6 +36,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
 
+/// RiverTaker on Base (theriver-market/river-contracts 740bd8a, verified on
+/// Blockscout): immutable orderbook/USDC/fee receiver/10 bps, no owner.
+const RIVER_TAKER_BASE: &str = "0xd0daDF272d6c07129c058B937B867428A46c4fDb";
+
 struct SwapAnalyticsContext {
     chain_id: Option<u32>,
     input_token: Address,
@@ -602,11 +606,18 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         chain_id: u32,
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError> {
-        let result = self
-            .client
-            .get_take_orders_calldata(request)
-            .await
-            .map_err(map_raindex_error)?;
+        // The River: when the taker is our pinned RiverTaker contract (it pulls
+        // funds from the user and charges the interface fee in the same tx),
+        // build the calldata without the taker approval check / preflight
+        // (the contract approves just in time and holds no balance). The site
+        // simulates the real RiverTaker.take call before the wallet opens.
+        let unchecked = request.taker.eq_ignore_ascii_case(RIVER_TAKER_BASE) && chain_id == 8453;
+        let result = if unchecked {
+            self.client.get_take_orders_calldata_unchecked(request).await
+        } else {
+            self.client.get_take_orders_calldata(request).await
+        }
+        .map_err(map_raindex_error)?;
 
         if let Some(approval_info) = result.approval_info() {
             let formatted_amount = approval_info.formatted_amount().to_string();
