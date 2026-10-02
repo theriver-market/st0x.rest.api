@@ -613,7 +613,9 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         // simulates the real RiverTaker.take call before the wallet opens.
         let unchecked = request.taker.eq_ignore_ascii_case(RIVER_TAKER_BASE) && chain_id == 8453;
         let result = if unchecked {
-            self.client.get_take_orders_calldata_unchecked(request).await
+            self.client
+                .get_take_orders_calldata_unchecked(request)
+                .await
         } else {
             self.client.get_take_orders_calldata(request).await
         }

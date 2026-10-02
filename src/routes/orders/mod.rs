@@ -144,6 +144,18 @@ pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType
         return OrderSummaryOrderType::DynamicSpread;
     }
 
+    // The River's strategies, by fingerprints unique to each Rainlang. Checked
+    // before DCA: river-ladder uses linear-growth and was labelled DCA (2 Oct).
+    if source.contains("Stop not triggered") {
+        return OrderSummaryOrderType::Stop;
+    }
+    if source.contains("Trade causes dust") {
+        return OrderSummaryOrderType::Ladder;
+    }
+    if is_cycle_source(&source) {
+        return OrderSummaryOrderType::Cycle;
+    }
+
     let handle_io = handle_io_section(&source);
     let has_dca_markers = handle_io.as_deref().is_some_and(|section| {
         section.contains("min-amount:")
@@ -160,6 +172,22 @@ pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType
     }
 
     OrderSummaryOrderType::Custom
+}
+
+/// river-cycle: `max-output: if(equal-to(get(<32-byte key>) <phase>) ...`.
+fn is_cycle_source(source: &str) -> bool {
+    source.lines().any(|line| {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        compact
+            .find("max-output:if(equal-to(get(0x")
+            .map(|i| {
+                let rest = &compact[i + "max-output:if(equal-to(get(0x".len()..];
+                rest.len() > 64
+                    && rest[..64].chars().all(|c| c.is_ascii_hexdigit())
+                    && rest[64..].starts_with(')')
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn handle_io_section(source: &str) -> Option<String> {
@@ -968,6 +996,23 @@ mod tests {
             classify_order_type(&order),
             OrderSummaryOrderType::DynamicSpread
         );
+    }
+
+    #[test]
+    fn test_classify_order_type_river_strategies() {
+        let stop = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nprice _: dia-price(\"SGOV\" 10800),\n:ensure(less-than-or-equal-to(price 50) \"Stop not triggered\"),\nmax-output: max-positive-value(),\nio: mul(price 1 0.98);\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&stop), OrderSummaryOrderType::Stop);
+        // Ladder uses linear-growth (a DCA marker) and must not be labelled DCA.
+        let ladder = mock_order_with_source(Some(
+            "/* 0. calculate-io */\ntranche-io-ratio: linear-growth(0.0111 0.0005 0),\n\n/* 1. handle-io */\n:ensure(any(is-zero(frac(x)) 1) \"Trade causes dust.\"),\n:;",
+        ));
+        assert_eq!(classify_order_type(&ladder), OrderSummaryOrderType::Ladder);
+        let cycle = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nmax-output io: call<2>();\n\n/* 1. handle-io */\n:call<3>();\n\n/* 2. sell-calculate-io */\nmax-output: if(equal-to(get(0x091156eed579139da9eba7cace36f041b0d573886e8c646976e79e27e3b91b25) 1) 0.03333333 0),\nio: 91.8;",
+        ));
+        assert_eq!(classify_order_type(&cycle), OrderSummaryOrderType::Cycle);
     }
 
     #[test]

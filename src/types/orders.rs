@@ -51,6 +51,12 @@ pub enum OrderSummaryOrderType {
     Dca,
     DynamicSpread,
     Custom,
+    /// The River's buy-the-dip ladder (river-ladder).
+    Ladder,
+    /// The River's DIA-triggered stop-loss (river-stop).
+    Stop,
+    /// The River's buy/sell cycle (river-cycle).
+    Cycle,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
