@@ -105,6 +105,16 @@ pub(crate) trait TradesDataSource: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// Transactions in which RiverTaker took orders on `taker`'s behalf
+    /// (Raindex records RiverTaker, not the user, as the taker of those fills).
+    async fn river_take_tx_hashes(
+        &self,
+        _chain_ids: Option<&[u32]>,
+        _taker: Address,
+    ) -> Result<Vec<B256>, ApiError> {
+        Ok(Vec::new())
+    }
+
     async fn get_current_wrap_ratios_for_tokens_on_chain(
         &self,
         _chain_id: u32,
@@ -140,6 +150,23 @@ pub(crate) struct RaindexTradesDataSource<'a> {
 
 #[async_trait]
 impl TradesDataSource for RaindexTradesDataSource<'_> {
+    async fn river_take_tx_hashes(
+        &self,
+        chain_ids: Option<&[u32]>,
+        taker: Address,
+    ) -> Result<Vec<B256>, ApiError> {
+        let chain = crate::river_takes::RIVER_TAKER_CHAIN_ID;
+        if chain_ids.is_some_and(|ids| !ids.contains(&chain)) {
+            return Ok(Vec::new());
+        }
+        crate::river_takes::tx_hashes_for_user(self.pool, chain, taker)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to read RiverTaker fills for taker");
+                ApiError::Internal("failed to query trades".into())
+            })
+    }
+
     async fn get_trades_by_tx(&self, tx_hash: B256) -> Result<RaindexTradesListResult, ApiError> {
         self.get_trades_by_tx_for_chains(None, tx_hash).await
     }

@@ -20,6 +20,7 @@ mod market_price;
 mod metrics;
 mod raindex;
 mod registry_artifact;
+mod river_takes;
 mod routes;
 mod swap_capacity;
 mod telemetry;
@@ -612,6 +613,16 @@ async fn main() {
                 };
 
             let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
+            {
+                let rpcs = shared_raindex
+                    .read()
+                    .await
+                    .raindex_yaml()
+                    .get_network_by_chain_id(river_takes::RIVER_TAKER_CHAIN_ID)
+                    .map(|network| network.rpcs)
+                    .unwrap_or_default();
+                tokio::spawn(river_takes::supervise(pool.clone(), rpcs));
+            }
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
             let swap_capacity = swap_capacity::SwapCapacity::new(
