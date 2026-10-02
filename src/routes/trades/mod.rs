@@ -2,6 +2,7 @@ pub(crate) mod get_by_address;
 pub(crate) mod get_by_taker;
 pub(crate) mod get_by_token;
 pub(crate) mod get_by_tx;
+pub(crate) mod get_recent;
 pub(crate) mod query;
 
 use crate::error::{ApiError, ApiErrorCode};
@@ -105,6 +106,17 @@ pub(crate) trait TradesDataSource: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// Latest trades across all tokens (newest first).
+    async fn get_recent_trades_on_chains(
+        &self,
+        _chain_ids: Option<Vec<u32>>,
+        _page: u16,
+        _page_size: u16,
+        _time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        Err(ApiError::Internal("recent trades unavailable".into()))
+    }
+
     /// Transactions in which RiverTaker took orders on `taker`'s behalf
     /// (Raindex records RiverTaker, not the user, as the taker of those fills).
     async fn river_take_tx_hashes(
@@ -150,6 +162,32 @@ pub(crate) struct RaindexTradesDataSource<'a> {
 
 #[async_trait]
 impl TradesDataSource for RaindexTradesDataSource<'_> {
+    async fn get_recent_trades_on_chains(
+        &self,
+        chain_ids: Option<Vec<u32>>,
+        page: u16,
+        page_size: u16,
+        time_filter: TimeFilter,
+    ) -> Result<RaindexTradesListResult, ApiError> {
+        let chain_ids = resolve_raindex_chain_ids(self.client, chain_ids)?;
+        let filters = GetTradesFilters {
+            time_filter: Some(time_filter),
+            ..Default::default()
+        };
+        self.client
+            .get_trades(
+                Some(ChainIds(chain_ids)),
+                Some(filters),
+                Some(page),
+                Some(page_size),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to query recent trades");
+                ApiError::Internal("failed to query trades".into())
+            })
+    }
+
     async fn river_take_tx_hashes(
         &self,
         chain_ids: Option<&[u32]>,
@@ -620,6 +658,7 @@ pub(super) fn trades_pagination_params(
 pub fn routes() -> Vec<Route> {
     rocket::routes![
         get_by_tx::get_trades_by_tx,
+        get_recent::get_recent_trades,
         query::post_trades_query,
         get_by_token::get_trades_by_token,
         get_by_taker::get_trades_by_taker,

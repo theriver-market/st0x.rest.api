@@ -258,6 +258,7 @@ enum StartupRegistryError {
         routes::trades::query::post_trades_query,
         routes::trades::get_by_token::get_trades_by_token,
         routes::trades::get_by_taker::get_trades_by_taker,
+        routes::trades::get_recent::get_recent_trades,
         routes::trades::get_by_address::get_trades_by_address,
         routes::registry::get_registry,
         routes::registry::get_registry_history,
