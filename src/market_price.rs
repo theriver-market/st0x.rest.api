@@ -38,6 +38,10 @@ const MAX_PRICE_MARKET_CONCURRENCY: usize = 4;
 const USDC_SYMBOL: &str = "USDC";
 const MARKET_QUOTE_EXTENSION: &str = "marketQuote";
 
+/// Minimum tradable size (in the quote token, USDC) for a quote to count toward
+/// the displayed midpoint.
+const MIN_DISPLAY_NOTIONAL_QUOTE: &str = "10";
+
 #[derive(Debug, Clone)]
 pub(crate) struct MarketPriceConfig {
     pub enabled: bool,
@@ -942,6 +946,29 @@ fn observed_quotes_from_decoded_order(
             continue;
         }
 
+        // A quote only counts toward the displayed price if it can trade a
+        // meaningful size: one small far bid/ask must not move the midpoint
+        // everyone sees (2 Oct: a $1.50 canary bid dragged wtSGOV ~6%).
+        if input_address == quote_token || output_address == quote_token {
+            let notional = if output_address == quote_token {
+                Ok(data.max_output)
+            } else {
+                data.max_output.mul(data.ratio)
+            };
+            let min = Float::parse(MIN_DISPLAY_NOTIONAL_QUOTE.to_string()).map_err(float_error)?;
+            match notional.map(|n| n.lt(min)) {
+                Ok(Ok(true)) => {
+                    tracing::debug!(
+                        order_hash = %order_hash,
+                        "excluding market quote below the display notional minimum"
+                    );
+                    continue;
+                }
+                Ok(Ok(false)) => {}
+                _ => continue,
+            }
+        }
+
         let observation = if input_address == quote_token {
             match variant_map.get(&output_address) {
                 Some(variant) => Some(ObservedQuote {
@@ -1475,7 +1502,8 @@ mod tests {
             ],
         };
         let invalid_quote = crate::test_helpers::wtmstr_quote("1e100", "1", "1", "1");
-        let mut valid_quote = crate::test_helpers::wtmstr_quote("1", "1", "1", "1");
+        // 1 token at 20 USDC: above the display notional minimum.
+        let mut valid_quote = crate::test_helpers::wtmstr_quote("1", "20", "20", "0.05");
         valid_quote.pair.output_index = 1;
         let one = Float::parse("1".to_string()).expect("valid multiplier");
         let variant_map = HashMap::from([
@@ -1512,6 +1540,46 @@ mod tests {
 
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].asset_address, ASSET_TWO);
+    }
+
+    fn notional_observations(max_output: &str, ratio: &str, inverse: &str, ask: bool) -> usize {
+        let order = if ask {
+            single_pair_order(crate::test_helpers::USDC, crate::test_helpers::WT_MSTR)
+        } else {
+            single_pair_order(crate::test_helpers::WT_MSTR, crate::test_helpers::USDC)
+        };
+        let quote = crate::test_helpers::wtmstr_quote(max_output, "1", ratio, inverse);
+        let variant_map = HashMap::from([(
+            crate::test_helpers::WT_MSTR,
+            MarketVariant {
+                canonical_address: crate::test_helpers::WT_MSTR,
+                price_multiplier: Float::parse("1".to_string()).expect("valid multiplier"),
+            },
+        )]);
+        let token_decimals = HashMap::from([
+            (crate::test_helpers::USDC, 6),
+            (crate::test_helpers::WT_MSTR, 18),
+        ]);
+        observed_quotes_from_decoded_order(
+            &order,
+            &[quote],
+            crate::test_helpers::USDC,
+            &variant_map,
+            &token_decimals,
+            alloy::primitives::B256::ZERO,
+        )
+        .expect("observations")
+        .len()
+    }
+
+    #[test]
+    fn small_quotes_do_not_move_the_displayed_price() {
+        // Ask: 0.01 token at 100 USDC = 1 USDC -> excluded; 1 token at 100 = 100 USDC -> kept.
+        assert_eq!(notional_observations("0.01", "100", "0.01", true), 0);
+        assert_eq!(notional_observations("1", "100", "0.01", true), 1);
+        // Bid offering 1.5 USDC (the 2 Oct canary rung) -> excluded; 50 USDC -> kept.
+        assert_eq!(notional_observations("1.5", "0.0111", "90", false), 0);
+        assert_eq!(notional_observations("50", "0.0111", "90", false), 1);
     }
 
     #[test]
