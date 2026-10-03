@@ -161,6 +161,12 @@ pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType
     }) {
         return OrderSummaryOrderType::Peg;
     }
+    if source
+        .lines()
+        .any(|line| line.trim_start().starts_with("rebalance-usd:"))
+    {
+        return OrderSummaryOrderType::Basket;
+    }
 
     let handle_io = handle_io_section(&source);
     let has_dca_markers = handle_io.as_deref().is_some_and(|section| {
@@ -1014,6 +1020,10 @@ mod tests {
             "/* 0. calculate-io */\nprice _: dia-price(\"NVDA\" 10800),\nshares-per-token: call<2>(),\nper-share: min(mul(price 0.997) 300),\nmax-output: max-positive-value(),\nio: inv(mul(per-share shares-per-token));\n\n/* 1. handle-io */\n:;",
         ));
         assert_eq!(classify_order_type(&peg), OrderSummaryOrderType::Peg);
+        let basket = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nrebalance-usd: if(greater-than(v-out mul(v-in add(1 0.02))) gap-usd 0),\nmax-output: 0,\nio: 1;\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&basket), OrderSummaryOrderType::Basket);
         // Ladder uses linear-growth (a DCA marker) and must not be labelled DCA.
         let ladder = mock_order_with_source(Some(
             "/* 0. calculate-io */\ntranche-io-ratio: linear-growth(0.0111 0.0005 0),\n\n/* 1. handle-io */\n:ensure(any(is-zero(frac(x)) 1) \"Trade causes dust.\"),\n:;",

@@ -59,6 +59,8 @@ pub enum OrderSummaryOrderType {
     Cycle,
     /// The River's oracle-pegged buy (river-peg).
     Peg,
+    /// The River's automated portfolio (river-basket).
+    Basket,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
