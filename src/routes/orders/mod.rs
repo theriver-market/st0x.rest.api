@@ -149,6 +149,9 @@ pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType
     if source.contains("Stop not triggered") {
         return OrderSummaryOrderType::Stop;
     }
+    if source.contains("Stop-buy not triggered") {
+        return OrderSummaryOrderType::StopBuy;
+    }
     if source.contains("Trade causes dust") {
         return OrderSummaryOrderType::Ladder;
     }
@@ -1024,6 +1027,14 @@ mod tests {
             "/* 0. calculate-io */\nrebalance-usd: if(greater-than(v-out mul(v-in add(1 0.02))) gap-usd 0),\nmax-output: 0,\nio: 1;\n\n/* 1. handle-io */\n:;",
         ));
         assert_eq!(classify_order_type(&basket), OrderSummaryOrderType::Basket);
+        let stop_buy = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nprice _: dia-price(\"NVDA\" 10800),\n:ensure(greater-than-or-equal-to(price 250) \"Stop-buy not triggered\"),\n:ensure(less-than-or-equal-to(price 260) \"Above max price\"),\nmax-output: max-positive-value(),\nio: div(1 mul(price 1 1.02));\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&stop_buy), OrderSummaryOrderType::StopBuy);
+        assert_eq!(
+            serde_json::to_string(&OrderSummaryOrderType::StopBuy).unwrap(),
+            "\"stop-buy\""
+        );
         // Ladder uses linear-growth (a DCA marker) and must not be labelled DCA.
         let ladder = mock_order_with_source(Some(
             "/* 0. calculate-io */\ntranche-io-ratio: linear-growth(0.0111 0.0005 0),\n\n/* 1. handle-io */\n:ensure(any(is-zero(frac(x)) 1) \"Trade causes dust.\"),\n:;",

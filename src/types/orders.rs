@@ -61,6 +61,8 @@ pub enum OrderSummaryOrderType {
     Peg,
     /// The River's automated portfolio (river-basket).
     Basket,
+    /// The River's buy-on-breakout (river-stop-buy).
+    StopBuy,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
