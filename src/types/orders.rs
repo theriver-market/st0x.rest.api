@@ -57,6 +57,8 @@ pub enum OrderSummaryOrderType {
     Stop,
     /// The River's buy/sell cycle (river-cycle).
     Cycle,
+    /// The River's oracle-pegged buy (river-peg).
+    Peg,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]

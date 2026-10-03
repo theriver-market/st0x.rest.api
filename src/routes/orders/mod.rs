@@ -155,6 +155,12 @@ pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType
     if is_cycle_source(&source) {
         return OrderSummaryOrderType::Cycle;
     }
+    if source.lines().any(|line| {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.starts_with("per-share:min(mul(price")
+    }) {
+        return OrderSummaryOrderType::Peg;
+    }
 
     let handle_io = handle_io_section(&source);
     let has_dca_markers = handle_io.as_deref().is_some_and(|section| {
@@ -1004,6 +1010,10 @@ mod tests {
             "/* 0. calculate-io */\nprice _: dia-price(\"SGOV\" 10800),\n:ensure(less-than-or-equal-to(price 50) \"Stop not triggered\"),\nmax-output: max-positive-value(),\nio: mul(price 1 0.98);\n\n/* 1. handle-io */\n:;",
         ));
         assert_eq!(classify_order_type(&stop), OrderSummaryOrderType::Stop);
+        let peg = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nprice _: dia-price(\"NVDA\" 10800),\nshares-per-token: call<2>(),\nper-share: min(mul(price 0.997) 300),\nmax-output: max-positive-value(),\nio: inv(mul(per-share shares-per-token));\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&peg), OrderSummaryOrderType::Peg);
         // Ladder uses linear-growth (a DCA marker) and must not be labelled DCA.
         let ladder = mock_order_with_source(Some(
             "/* 0. calculate-io */\ntranche-io-ratio: linear-growth(0.0111 0.0005 0),\n\n/* 1. handle-io */\n:ensure(any(is-zero(frac(x)) 1) \"Trade causes dust.\"),\n:;",
