@@ -158,6 +158,14 @@ pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType
     if is_cycle_source(&source) {
         return OrderSummaryOrderType::Cycle;
     }
+    // river-spread: `ask-per-share: max(mul(price ...)) min-sell` (its bid line
+    // is peg-like, so it is checked first).
+    if source.lines().any(|line| {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.starts_with("ask-per-share:max(mul(price")
+    }) {
+        return OrderSummaryOrderType::Spread;
+    }
     if source.lines().any(|line| {
         let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
         compact.starts_with("per-share:min(mul(price")
@@ -1030,7 +1038,18 @@ mod tests {
         let stop_buy = mock_order_with_source(Some(
             "/* 0. calculate-io */\nprice _: dia-price(\"NVDA\" 10800),\n:ensure(greater-than-or-equal-to(price 250) \"Stop-buy not triggered\"),\n:ensure(less-than-or-equal-to(price 260) \"Above max price\"),\nmax-output: max-positive-value(),\nio: div(1 mul(price 1 1.02));\n\n/* 1. handle-io */\n:;",
         ));
-        assert_eq!(classify_order_type(&stop_buy), OrderSummaryOrderType::StopBuy);
+        assert_eq!(
+            classify_order_type(&stop_buy),
+            OrderSummaryOrderType::StopBuy
+        );
+        let spread = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nprice _: dia-price(0x01 10800),\nask-per-share: max(mul(price add(1 s)) 90),\nbid-per-share: min(mul(price sub(1 s)) 110),\nmax-output: max-positive-value(),\nio: 1;\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&spread), OrderSummaryOrderType::Spread);
+        assert_eq!(
+            serde_json::to_string(&OrderSummaryOrderType::Spread).unwrap(),
+            "\"spread\""
+        );
         assert_eq!(
             serde_json::to_string(&OrderSummaryOrderType::StopBuy).unwrap(),
             "\"stop-buy\""

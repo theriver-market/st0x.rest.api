@@ -63,6 +63,8 @@ pub enum OrderSummaryOrderType {
     Basket,
     /// The River's buy-on-breakout (river-stop-buy).
     StopBuy,
+    /// The River's two-sided quotes around the oracle (river-spread).
+    Spread,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
