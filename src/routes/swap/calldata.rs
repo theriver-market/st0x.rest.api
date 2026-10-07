@@ -588,11 +588,13 @@ async fn build_calldata_candidates(
         .build_candidates_for_pair(&orders, input_token, output_token, taker)
         .await
         .map_err(map_calldata_boundary_error)?;
-    if let Some(error) = candidate_build.failures.oracle_unavailable_error() {
-        return Err(error);
-    }
+    // Executable candidates win in a mixed book: an order whose oracle can't be
+    // fetched can't be taken, so it can't make the user's price worse.
     if candidate_build.candidates.is_empty() {
-        return Err(no_liquidity_error());
+        return Err(candidate_build
+            .failures
+            .oracle_unavailable_error()
+            .unwrap_or_else(no_liquidity_error));
     }
     Ok(candidate_build)
 }
@@ -1967,7 +1969,9 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn test_process_swap_calldata_v2_slippage_rejects_incomplete_price_basis() {
+    async fn test_process_swap_calldata_v2_slippage_prices_from_executable_candidates() {
+        // An order whose oracle can't be fetched can't be taken: the cap comes from the
+        // executable candidates (2 + 50 bps) instead of failing the whole pair.
         let (ds, captured_request) = capture_candidate_outcome_ds(
             vec![mock_candidate("100", "2")],
             vec![super::super::SwapQuoteFailure::OracleUnavailable],
@@ -1977,10 +1981,12 @@ mod tests {
             &ds,
             slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50),
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
-        no_take_orders_request_was_made(&captured_request);
+        let request = captured_take_orders_request(&captured_request);
+        assert_eq!(request.price_cap, "2.01");
+        assert_eq!(result.resolved_price_cap, "2.01");
     }
 
     #[rocket::async_test]

@@ -456,9 +456,10 @@ async fn process_swap_quote_v2(
             slippage_bps,
             reference_io_ratio,
         } => {
-            if let Some(error) = failures.oracle_unavailable_error() {
-                return Err(error);
-            }
+            // An order whose oracle can't be fetched can't be taken either, so the
+            // executable candidates are the whole executable book: price from them.
+            // (River 7 Oct: one NVDA order with a retired oracle URL 503'd every NVDA
+            // quote while a live order could fill.) Shortfalls still report the oracle.
             let reference_io_ratio = reference_io_ratio
                 .map(|reference_io_ratio| {
                     normalize_calldata_price_cap(
