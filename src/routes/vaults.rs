@@ -398,8 +398,101 @@ pub async fn get_vault_totals(
     .await
 }
 
+/// One deposit, withdrawal or fill on a vault (own index; for The River's strategy P&L,
+/// research/OWN-INDEXER.md). Amounts are raw token units (signed: negative = out of the vault).
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultChangeResponse {
+    pub kind: String,
+    pub amount: String,
+    pub old_balance: String,
+    pub new_balance: String,
+    pub token: String,
+    pub timestamp: u64,
+    pub tx_hash: String,
+    pub sender: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultChangesResponse {
+    pub chain_id: u32,
+    pub vault: String,
+    pub page: u16,
+    pub changes: Vec<VaultChangeResponse>,
+}
+
+fn raw_units(v: rain_math_float::Float, decimals: u8, what: &str) -> Result<String, ApiError> {
+    // Signed: to_fixed_decimal_lossy refuses negatives, so convert the magnitude and re-sign.
+    let zero = rain_math_float::Float::parse("0".to_string())
+        .map_err(|_| ApiError::Internal("float".into()))?;
+    let negative = v.lt(zero).map_err(|_| ApiError::Internal("float".into()))?;
+    let magnitude = if negative { v.abs().map_err(|_| ApiError::Internal("float".into()))? } else { v };
+    let (u, _) = magnitude.to_fixed_decimal_lossy(decimals).map_err(|error| {
+        tracing::error!(error = %error, what, "failed to convert vault change to raw token units");
+        ApiError::Internal("failed to convert vault change".into())
+    })?;
+    Ok(if negative { format!("-{u}") } else { u.to_string() })
+}
+
+#[get("/<chain_id>/<raindex>/<id>/changes?<page>")]
+pub async fn get_vault_changes(
+    _global: GlobalRateLimit,
+    _key: AuthenticatedKey,
+    shared_raindex: &State<crate::raindex::SharedRaindexProvider>,
+    span: TracingSpan,
+    chain_id: u32,
+    raindex: &str,
+    id: &str,
+    page: Option<u16>,
+) -> Result<Json<VaultChangesResponse>, ApiError> {
+    async move {
+        let raindex_address = parse_address(raindex, "raindex")?;
+        let vault_id: alloy::primitives::Bytes = id
+            .parse()
+            .map_err(|_| ApiError::BadRequest("id must be hex".into()))?;
+        let page = page.unwrap_or(1).max(1);
+        let provider = shared_raindex.read().await;
+        let ident = rain_orderbook_common::local_db::RaindexIdentifier::new(chain_id, raindex_address);
+        let vault = provider
+            .client()
+            .get_vault(&ident, vault_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, chain_id, id, "vault not found");
+                ApiError::NotFound("vault not found".into())
+            })?;
+        let decimals = vault.token().decimals();
+        let changes = vault
+            .get_balance_changes(Some(page), None)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, chain_id, id, "failed to read vault changes");
+                ApiError::Internal("failed to read vault changes".into())
+            })?
+            .into_iter()
+            .map(|c| {
+                let tx = c.transaction();
+                Ok(VaultChangeResponse {
+                    kind: c.type_display_name().to_string(),
+                    amount: raw_units(c.amount(), decimals, "amount")?,
+                    old_balance: raw_units(c.old_balance(), decimals, "old_balance")?,
+                    new_balance: raw_units(c.new_balance(), decimals, "new_balance")?,
+                    token: c.token().address().to_string(),
+                    timestamp: c.timestamp().try_into().unwrap_or(u64::MAX),
+                    tx_hash: tx.id().to_string(),
+                    sender: tx.from().to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(Json(VaultChangesResponse { chain_id, vault: id.to_string(), page, changes }))
+    }
+    .instrument(span.0)
+    .await
+}
+
 pub fn routes() -> Vec<Route> {
-    rocket::routes![get_vault_totals, get_vaults]
+    rocket::routes![get_vault_totals, get_vaults, get_vault_changes]
 }
 
 pub fn routes_v2() -> Vec<Route> {
