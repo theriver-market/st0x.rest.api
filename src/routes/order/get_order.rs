@@ -198,6 +198,7 @@ fn build_order_detail(
         created_at,
         orderbook_id: order.raindex(),
         trades: trade_entries,
+        rainlang: crate::routes::orders::order_source(order),
     })
 }
 
@@ -308,6 +309,43 @@ mod tests {
         assert_eq!(detail.trades[0].input_amount, "0.500000");
         assert_eq!(detail.trades[0].output_amount, "-0.250000000000000000");
         assert_eq!(detail.trades[0].timestamp, 1700001000);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_order_includes_rainlang() {
+        let ds = MockOrderDataSource {
+            orders: Ok(vec![mock_order_with_rainlang(RIVER_PEG_RAINLANG)]),
+            trades: Ok(vec![]),
+            quotes: Ok(vec![mock_quote("1.5")]),
+            calldata: Ok(Bytes::new()),
+        };
+        let detail = process_get_order(&ds, test_hash(), Denomination::Wrapped)
+            .await
+            .unwrap();
+
+        assert_eq!(detail.rainlang.as_deref(), Some(RIVER_PEG_RAINLANG));
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["rainlang"], RIVER_PEG_RAINLANG);
+        // Existing fields unchanged.
+        assert_eq!(json["ioRatio"], "1.5");
+        assert_eq!(json["inputVaultBalance"], "1.000000");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_order_without_rainlang_omits_field() {
+        let ds = MockOrderDataSource {
+            orders: Ok(vec![mock_order()]),
+            trades: Ok(vec![]),
+            quotes: Ok(vec![mock_quote("1.5")]),
+            calldata: Ok(Bytes::new()),
+        };
+        let detail = process_get_order(&ds, test_hash(), Denomination::Wrapped)
+            .await
+            .unwrap();
+
+        assert_eq!(detail.rainlang, None);
+        let json = serde_json::to_value(&detail).unwrap();
+        assert!(json.get("rainlang").is_none());
     }
 
     #[rocket::async_test]

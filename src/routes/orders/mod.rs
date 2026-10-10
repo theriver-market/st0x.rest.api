@@ -134,8 +134,13 @@ pub(crate) fn active_filter_for_state(state: Option<OrderState>) -> Option<bool>
     }
 }
 
+/// The order's Rainlang from its onchain meta, falling back to the dotrain source.
+pub(crate) fn order_source(order: &RaindexOrder) -> Option<String> {
+    order.rainlang().or_else(|| order.dotrain_source())
+}
+
 pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType {
-    let source = order.rainlang().or_else(|| order.dotrain_source());
+    let source = order_source(order);
     let Some(source) = source else {
         return OrderSummaryOrderType::Custom;
     };
@@ -640,6 +645,7 @@ pub(crate) fn build_order_summary(
         io_ratio,
         created_at,
         orderbook_id: order.raindex(),
+        rainlang: None,
     })
 }
 

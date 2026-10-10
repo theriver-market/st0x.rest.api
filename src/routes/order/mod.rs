@@ -394,6 +394,15 @@ pub(crate) mod test_fixtures {
         serde_json::from_value(order_json()).expect("deserialize mock RaindexOrder")
     }
 
+    pub const RIVER_PEG_RAINLANG: &str =
+        "#calculate-io\nper-share: min(mul(price 1.01) 250),\nmax-output: 100;\n#handle-io\n:;";
+
+    pub fn mock_order_with_rainlang(rainlang: &str) -> RaindexOrder {
+        let mut value = order_json();
+        value["rainlang"] = json!(rainlang);
+        serde_json::from_value(value).expect("deserialize mock RaindexOrder with rainlang")
+    }
+
     pub fn order_with_shared_vaults_json() -> serde_json::Value {
         let rc = stub_raindex_client();
         let shared_vault = |id: &str,
