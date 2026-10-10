@@ -251,6 +251,7 @@ enum StartupRegistryError {
         routes::orders::post_orders_query,
         routes::vaults::get_vaults,
         routes::vaults::get_vault_totals,
+        routes::vaults::get_vault_changes,
         routes::admin::put_registry,
         routes::attribution_admin::get_attributed_executions,
         routes::attribution_admin::get_attribution_volume,

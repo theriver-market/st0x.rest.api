@@ -125,3 +125,46 @@ pub struct VaultTotalResponse {
 pub struct VaultTotalsResponse {
     pub totals: Vec<VaultTotalResponse>,
 }
+
+/// One deposit, withdrawal or fill on a vault (own index; for The River's strategy P&L).
+/// Amounts and balances are raw token units (integers as strings); `amount` is signed:
+/// negative = out of the vault.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultChangeResponse {
+    /// Machine key: deposit | withdrawal | takeOrder | clear | clearBounty | unknown.
+    #[schema(example = "takeOrder")]
+    pub change_type: String,
+    /// SDK display name (e.g. "Take order").
+    #[schema(example = "Take order")]
+    pub kind: String,
+    #[schema(example = "-1500000")]
+    pub amount: String,
+    #[schema(example = "10000000")]
+    pub old_balance: String,
+    #[schema(example = "8500000")]
+    pub new_balance: String,
+    #[schema(example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
+    pub token: String,
+    #[schema(example = 6)]
+    pub decimals: u8,
+    #[schema(example = 1760000000)]
+    pub timestamp: u64,
+    #[schema(example = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")]
+    pub tx_hash: String,
+    #[schema(example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub sender: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultChangesResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
+    #[schema(example = "0xabcdef")]
+    pub vault: String,
+    #[schema(example = 1)]
+    pub page: u16,
+    /// Newest first.
+    pub changes: Vec<VaultChangeResponse>,
+}

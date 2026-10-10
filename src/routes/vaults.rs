@@ -3,15 +3,16 @@ use crate::error::{ApiError, ApiErrorResponse};
 use crate::fairings::{GlobalRateLimit, TracingSpan};
 use crate::routes::resolve_raindex_chain_ids;
 use crate::types::vaults::{
-    VaultOrderRef, VaultPositionResponse, VaultTokenResponse, VaultTotalResponse,
-    VaultTotalTokenResponse, VaultTotalsQueryParams, VaultTotalsResponse, VaultsPagination,
-    VaultsQueryParams, VaultsResponse,
+    VaultChangeResponse, VaultChangesResponse, VaultOrderRef, VaultPositionResponse,
+    VaultTokenResponse, VaultTotalResponse, VaultTotalTokenResponse, VaultTotalsQueryParams,
+    VaultTotalsResponse, VaultsPagination, VaultsQueryParams, VaultsResponse,
 };
-use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, B256, U256};
 use async_trait::async_trait;
+use rain_math_float::Float;
 use rain_orderbook_common::raindex_client::{
     types::ChainIds,
-    vaults::{GetVaultsFilters, RaindexVault},
+    vaults::{GetVaultsFilters, RaindexVault, RaindexVaultBalanceChangeType},
     RaindexClient,
 };
 use rocket::serde::json::Json;
@@ -398,43 +399,182 @@ pub async fn get_vault_totals(
     .await
 }
 
-/// One deposit, withdrawal or fill on a vault (own index; for The River's strategy P&L,
-/// research/OWN-INDEXER.md). Amounts are raw token units (signed: negative = out of the vault).
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultChangeResponse {
-    pub kind: String,
-    pub amount: String,
-    pub old_balance: String,
-    pub new_balance: String,
-    pub token: String,
+/// One deposit, withdrawal or fill on a vault, as read from the SDK (own index; for
+/// The River's strategy P&L, research/OWN-INDEXER.md). Amounts stay as SDK floats here and
+/// are converted to raw signed token units by `process_get_vault_changes`.
+#[derive(Debug, Clone)]
+pub(crate) struct VaultChangeRecord {
+    pub change_type: RaindexVaultBalanceChangeType,
+    pub amount: Float,
+    pub old_balance: Float,
+    pub new_balance: Float,
+    pub token: Address,
+    pub decimals: u8,
     pub timestamp: u64,
-    pub tx_hash: String,
-    pub sender: String,
+    pub tx_hash: B256,
+    pub sender: Address,
 }
 
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultChangesResponse {
-    pub chain_id: u32,
-    pub vault: String,
-    pub page: u16,
-    pub changes: Vec<VaultChangeResponse>,
+#[async_trait]
+pub(crate) trait VaultChangesDataSource: Send + Sync {
+    /// All balance changes for one vault. `Ok(None)` when the vault is unknown.
+    async fn get_vault_changes(
+        &self,
+        chain_id: u32,
+        raindex: Address,
+        vault: Bytes,
+        page: u16,
+    ) -> Result<Option<Vec<VaultChangeRecord>>, ApiError>;
 }
 
-fn raw_units(v: rain_math_float::Float, decimals: u8, what: &str) -> Result<String, ApiError> {
-    // Signed: to_fixed_decimal_lossy refuses negatives, so convert the magnitude and re-sign.
-    let zero = rain_math_float::Float::parse("0".to_string())
-        .map_err(|_| ApiError::Internal("float".into()))?;
-    let negative = v.lt(zero).map_err(|_| ApiError::Internal("float".into()))?;
-    let magnitude = if negative { v.abs().map_err(|_| ApiError::Internal("float".into()))? } else { v };
-    let (u, _) = magnitude.to_fixed_decimal_lossy(decimals).map_err(|error| {
+#[async_trait]
+impl VaultChangesDataSource for RaindexVaultsDataSource<'_> {
+    async fn get_vault_changes(
+        &self,
+        chain_id: u32,
+        raindex: Address,
+        vault: Bytes,
+        page: u16,
+    ) -> Result<Option<Vec<VaultChangeRecord>>, ApiError> {
+        let ident = rain_orderbook_common::local_db::RaindexIdentifier::new(chain_id, raindex);
+        let vault = match self.client.get_vault(&ident, vault.clone()).await {
+            Ok(vault) => vault,
+            Err(error) => {
+                tracing::warn!(error = %error, chain_id, vault = %vault, "vault not found");
+                return Ok(None);
+            }
+        };
+        let decimals = vault.token().decimals();
+        let changes = vault
+            .get_balance_changes(Some(page), None)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, chain_id, "failed to read vault changes");
+                ApiError::Internal("failed to read vault changes".into())
+            })?;
+        Ok(Some(
+            changes
+                .into_iter()
+                .map(|change| {
+                    let tx = change.transaction();
+                    VaultChangeRecord {
+                        change_type: change.r#type(),
+                        amount: change.amount(),
+                        old_balance: change.old_balance(),
+                        new_balance: change.new_balance(),
+                        token: change.token().address(),
+                        decimals,
+                        timestamp: change.timestamp().try_into().unwrap_or(u64::MAX),
+                        tx_hash: tx.id(),
+                        sender: tx.from(),
+                    }
+                })
+                .collect(),
+        ))
+    }
+}
+
+fn change_type_key(change_type: &RaindexVaultBalanceChangeType) -> &'static str {
+    match change_type {
+        RaindexVaultBalanceChangeType::Deposit => "deposit",
+        RaindexVaultBalanceChangeType::Withdrawal => "withdrawal",
+        RaindexVaultBalanceChangeType::TakeOrder => "takeOrder",
+        RaindexVaultBalanceChangeType::Clear => "clear",
+        RaindexVaultBalanceChangeType::ClearBounty => "clearBounty",
+        RaindexVaultBalanceChangeType::Unknown => "unknown",
+    }
+}
+
+/// Converts an SDK float to raw token units, keeping the sign (negative = out of the vault).
+fn raw_units(v: Float, decimals: u8, what: &str) -> Result<String, ApiError> {
+    let float_error = |error: rain_math_float::FloatError| {
+        tracing::error!(error = %error, what, "float comparison failed for vault change");
+        ApiError::Internal("failed to convert vault change".into())
+    };
+    // to_fixed_decimal_lossy refuses negatives, so convert the magnitude and re-sign.
+    let zero = Float::parse("0".to_string()).map_err(float_error)?;
+    let negative = v.lt(zero).map_err(float_error)?;
+    let magnitude = if negative {
+        v.abs().map_err(float_error)?
+    } else {
+        v
+    };
+    let (units, _) = magnitude.to_fixed_decimal_lossy(decimals).map_err(|error| {
         tracing::error!(error = %error, what, "failed to convert vault change to raw token units");
         ApiError::Internal("failed to convert vault change".into())
     })?;
-    Ok(if negative { format!("-{u}") } else { u.to_string() })
+    Ok(if negative && !units.is_zero() {
+        format!("-{units}")
+    } else {
+        units.to_string()
+    })
 }
 
+pub(crate) async fn process_get_vault_changes(
+    ds: &dyn VaultChangesDataSource,
+    chain_id: u32,
+    raindex: &str,
+    id: &str,
+    page: Option<u16>,
+) -> Result<VaultChangesResponse, ApiError> {
+    let raindex_address = parse_address(raindex, "raindex")?;
+    let vault: Bytes = id.parse().map_err(|_| {
+        tracing::warn!(id, "invalid vault id");
+        ApiError::BadRequest("id must be hex".into())
+    })?;
+    let page = page.unwrap_or(DEFAULT_PAGE).max(1);
+    let mut records = ds
+        .get_vault_changes(chain_id, raindex_address, vault, page)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("vault not found".into()))?;
+    // Newest first. Stable, so the source's block/log order holds within one timestamp.
+    records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    let changes = records
+        .into_iter()
+        .map(|record| {
+            Ok(VaultChangeResponse {
+                change_type: change_type_key(&record.change_type).to_string(),
+                kind: record.change_type.display_name().to_string(),
+                amount: raw_units(record.amount, record.decimals, "amount")?,
+                old_balance: raw_units(record.old_balance, record.decimals, "old_balance")?,
+                new_balance: raw_units(record.new_balance, record.decimals, "new_balance")?,
+                token: record.token.to_string(),
+                decimals: record.decimals,
+                timestamp: record.timestamp,
+                tx_hash: record.tx_hash.to_string(),
+                sender: record.sender.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(VaultChangesResponse {
+        chain_id,
+        vault: id.to_string(),
+        page,
+        changes,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/vaults/{chain_id}/{raindex}/{id}/changes",
+    tag = "Vaults",
+    security(("basicAuth" = [])),
+    params(
+        ("chain_id" = u32, Path, description = "Chain id"),
+        ("raindex" = String, Path, description = "Raindex (orderbook) contract address"),
+        ("id" = String, Path, description = "Vault id as returned by /v2/vaults (`id`, hex)"),
+        ("page" = Option<u16>, Query, description = "Page (subgraph-backed chains only; the local index returns every change)"),
+    ),
+    responses(
+        (status = 200, description = "Deposits, withdrawals and fills on the vault, newest first, in raw signed token units", body = VaultChangesResponse),
+        (status = 400, description = "Bad request", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 404, description = "Vault not found", body = ApiErrorResponse),
+        (status = 429, description = "Rate limited", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    )
+)]
+#[allow(clippy::too_many_arguments)]
 #[get("/<chain_id>/<raindex>/<id>/changes?<page>")]
 pub async fn get_vault_changes(
     _global: GlobalRateLimit,
@@ -447,45 +587,22 @@ pub async fn get_vault_changes(
     page: Option<u16>,
 ) -> Result<Json<VaultChangesResponse>, ApiError> {
     async move {
-        let raindex_address = parse_address(raindex, "raindex")?;
-        let vault_id: alloy::primitives::Bytes = id
-            .parse()
-            .map_err(|_| ApiError::BadRequest("id must be hex".into()))?;
-        let page = page.unwrap_or(1).max(1);
+        tracing::info!(chain_id, raindex, id, ?page, "request received");
         let provider = shared_raindex.read().await;
-        let ident = rain_orderbook_common::local_db::RaindexIdentifier::new(chain_id, raindex_address);
-        let vault = provider
-            .client()
-            .get_vault(&ident, vault_id)
+        let ds = RaindexVaultsDataSource {
+            client: provider.client(),
+        };
+        let response = process_get_vault_changes(&ds, chain_id, raindex, id, page)
             .await
             .map_err(|error| {
-                tracing::warn!(error = %error, chain_id, id, "vault not found");
-                ApiError::NotFound("vault not found".into())
+                tracing::warn!(chain_id, id, error = %error, "get_vault_changes failed");
+                error
             })?;
-        let decimals = vault.token().decimals();
-        let changes = vault
-            .get_balance_changes(Some(page), None)
-            .await
-            .map_err(|error| {
-                tracing::error!(error = %error, chain_id, id, "failed to read vault changes");
-                ApiError::Internal("failed to read vault changes".into())
-            })?
-            .into_iter()
-            .map(|c| {
-                let tx = c.transaction();
-                Ok(VaultChangeResponse {
-                    kind: c.type_display_name().to_string(),
-                    amount: raw_units(c.amount(), decimals, "amount")?,
-                    old_balance: raw_units(c.old_balance(), decimals, "old_balance")?,
-                    new_balance: raw_units(c.new_balance(), decimals, "new_balance")?,
-                    token: c.token().address().to_string(),
-                    timestamp: c.timestamp().try_into().unwrap_or(u64::MAX),
-                    tx_hash: tx.id().to_string(),
-                    sender: tx.from().to_string(),
-                })
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?;
-        Ok(Json(VaultChangesResponse { chain_id, vault: id.to_string(), page, changes }))
+        tracing::info!(
+            change_count = response.changes.len(),
+            "returning vault changes"
+        );
+        Ok(Json(response))
     }
     .instrument(span.0)
     .await
@@ -810,6 +927,347 @@ mod tests {
         assert_eq!(response.totals.len(), 1);
         assert_eq!(response.totals[0].total_balance, "9");
         assert_eq!(response.totals[0].vault_count, 1);
+    }
+
+    type VaultChangesCall = (u32, Address, Bytes, u16);
+
+    #[derive(Clone, Default)]
+    struct MockVaultChangesDataSource {
+        /// None = vault unknown.
+        changes: Option<Vec<VaultChangeRecord>>,
+        error: Option<ApiError>,
+        calls: Arc<Mutex<Vec<VaultChangesCall>>>,
+    }
+
+    #[async_trait]
+    impl VaultChangesDataSource for MockVaultChangesDataSource {
+        async fn get_vault_changes(
+            &self,
+            chain_id: u32,
+            raindex: Address,
+            vault: Bytes,
+            page: u16,
+        ) -> Result<Option<Vec<VaultChangeRecord>>, ApiError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((chain_id, raindex, vault, page));
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            Ok(self.changes.clone())
+        }
+    }
+
+    const VAULT: &str = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn float(value: &str) -> Float {
+        Float::parse(value.to_string()).unwrap()
+    }
+
+    fn change(
+        change_type: RaindexVaultBalanceChangeType,
+        amount: &str,
+        old_balance: &str,
+        new_balance: &str,
+        timestamp: u64,
+        tx_seed: u8,
+    ) -> VaultChangeRecord {
+        VaultChangeRecord {
+            change_type,
+            amount: float(amount),
+            old_balance: float(old_balance),
+            new_balance: float(new_balance),
+            token: TOKEN_A,
+            decimals: 6,
+            timestamp,
+            tx_hash: B256::from([tx_seed; 32]),
+            sender: OWNER,
+        }
+    }
+
+    /// Deposit 10 USDC, fill takes 1.5 out, withdraw 2.25, fill brings 0.000001 in.
+    /// Given oldest first, as a source might.
+    fn usdc_history() -> Vec<VaultChangeRecord> {
+        vec![
+            change(
+                RaindexVaultBalanceChangeType::Deposit,
+                "10",
+                "0",
+                "10",
+                100,
+                1,
+            ),
+            change(
+                RaindexVaultBalanceChangeType::TakeOrder,
+                "-1.5",
+                "10",
+                "8.5",
+                200,
+                2,
+            ),
+            change(
+                RaindexVaultBalanceChangeType::Withdrawal,
+                "-2.25",
+                "8.5",
+                "6.25",
+                300,
+                3,
+            ),
+            change(
+                RaindexVaultBalanceChangeType::Clear,
+                "0.000001",
+                "6.25",
+                "6.250001",
+                400,
+                4,
+            ),
+        ]
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_raw_signed_units_newest_first() {
+        let ds = MockVaultChangesDataSource {
+            changes: Some(usdc_history()),
+            ..Default::default()
+        };
+
+        let response = process_get_vault_changes(&ds, 8453, &ORDERBOOK.to_string(), VAULT, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.chain_id, 8453);
+        assert_eq!(response.vault, VAULT);
+        assert_eq!(response.page, 1);
+        let rows: Vec<(&str, &str, &str, &str, &str, u64)> = response
+            .changes
+            .iter()
+            .map(|c| {
+                (
+                    c.change_type.as_str(),
+                    c.kind.as_str(),
+                    c.amount.as_str(),
+                    c.old_balance.as_str(),
+                    c.new_balance.as_str(),
+                    c.timestamp,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("clear", "Clear", "1", "6250000", "6250001", 400),
+                (
+                    "withdrawal",
+                    "Withdrawal",
+                    "-2250000",
+                    "8500000",
+                    "6250000",
+                    300
+                ),
+                (
+                    "takeOrder",
+                    "Take order",
+                    "-1500000",
+                    "10000000",
+                    "8500000",
+                    200
+                ),
+                ("deposit", "Deposit", "10000000", "0", "10000000", 100),
+            ]
+        );
+        let deposit = &response.changes[3];
+        assert_eq!(deposit.token, TOKEN_A.to_string());
+        assert_eq!(deposit.decimals, 6);
+        assert_eq!(deposit.sender, OWNER.to_string());
+        assert_eq!(deposit.tx_hash, B256::from([1u8; 32]).to_string());
+
+        // Balances chain: each row's oldBalance + amount == newBalance (raw units).
+        for c in &response.changes {
+            let old: i128 = c.old_balance.parse().unwrap();
+            let amount: i128 = c.amount.parse().unwrap();
+            let new: i128 = c.new_balance.parse().unwrap();
+            assert_eq!(old + amount, new, "{c:?}");
+        }
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_serialises_camel_case() {
+        let ds = MockVaultChangesDataSource {
+            changes: Some(vec![change(
+                RaindexVaultBalanceChangeType::TakeOrder,
+                "-1.5",
+                "10",
+                "8.5",
+                200,
+                2,
+            )]),
+            ..Default::default()
+        };
+        let response = process_get_vault_changes(&ds, 8453, &ORDERBOOK.to_string(), VAULT, Some(2))
+            .await
+            .unwrap();
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["chainId"], 8453);
+        assert_eq!(json["page"], 2);
+        let row = &json["changes"][0];
+        assert_eq!(row["changeType"], "takeOrder");
+        assert_eq!(row["kind"], "Take order");
+        assert_eq!(row["amount"], "-1500000");
+        assert_eq!(row["oldBalance"], "10000000");
+        assert_eq!(row["newBalance"], "8500000");
+        assert_eq!(row["decimals"], 6);
+        assert_eq!(row["timestamp"], 200);
+        assert!(row["txHash"].as_str().unwrap().starts_with("0x0202"));
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_keeps_source_order_within_one_timestamp() {
+        // Two fills in one block: the source orders them (log index desc); keep that.
+        let ds = MockVaultChangesDataSource {
+            changes: Some(vec![
+                change(
+                    RaindexVaultBalanceChangeType::TakeOrder,
+                    "-1",
+                    "9",
+                    "8",
+                    500,
+                    7,
+                ),
+                change(
+                    RaindexVaultBalanceChangeType::TakeOrder,
+                    "-1",
+                    "10",
+                    "9",
+                    500,
+                    6,
+                ),
+                change(
+                    RaindexVaultBalanceChangeType::Deposit,
+                    "10",
+                    "0",
+                    "10",
+                    100,
+                    5,
+                ),
+            ]),
+            ..Default::default()
+        };
+        let response = process_get_vault_changes(&ds, 8453, &ORDERBOOK.to_string(), VAULT, None)
+            .await
+            .unwrap();
+        let new_balances: Vec<&str> = response
+            .changes
+            .iter()
+            .map(|c| c.new_balance.as_str())
+            .collect();
+        assert_eq!(new_balances, vec!["8000000", "9000000", "10000000"]);
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_18_decimals() {
+        let mut record = change(
+            RaindexVaultBalanceChangeType::Withdrawal,
+            "-0.123456789012345678",
+            "1",
+            "0.876543210987654322",
+            1,
+            1,
+        );
+        record.decimals = 18;
+        let ds = MockVaultChangesDataSource {
+            changes: Some(vec![record]),
+            ..Default::default()
+        };
+        let response = process_get_vault_changes(&ds, 8453, &ORDERBOOK.to_string(), VAULT, None)
+            .await
+            .unwrap();
+        assert_eq!(response.changes[0].amount, "-123456789012345678");
+        assert_eq!(response.changes[0].old_balance, "1000000000000000000");
+        assert_eq!(response.changes[0].new_balance, "876543210987654322");
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_empty_vault() {
+        let ds = MockVaultChangesDataSource {
+            changes: Some(vec![]),
+            ..Default::default()
+        };
+        let response = process_get_vault_changes(&ds, 8453, &ORDERBOOK.to_string(), VAULT, None)
+            .await
+            .unwrap();
+        assert!(response.changes.is_empty());
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["changes"], serde_json::json!([]));
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_passes_params_to_source() {
+        let ds = MockVaultChangesDataSource {
+            changes: Some(vec![]),
+            ..Default::default()
+        };
+        process_get_vault_changes(&ds, 46630, &ORDERBOOK.to_string(), VAULT, Some(0))
+            .await
+            .unwrap();
+        let calls = ds.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 46630);
+        assert_eq!(calls[0].1, ORDERBOOK);
+        assert_eq!(calls[0].2, VAULT.parse::<Bytes>().unwrap());
+        assert_eq!(calls[0].3, 1, "page 0 clamps to 1");
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_unknown_vault_is_404() {
+        let ds = MockVaultChangesDataSource::default();
+        let err = process_get_vault_changes(&ds, 8453, &ORDERBOOK.to_string(), VAULT, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_rejects_bad_input_without_calling_source() {
+        let ds = MockVaultChangesDataSource {
+            changes: Some(vec![]),
+            ..Default::default()
+        };
+        let err = process_get_vault_changes(&ds, 8453, "not-an-address", VAULT, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        let err = process_get_vault_changes(&ds, 8453, &ORDERBOOK.to_string(), "zz", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert!(ds.calls.lock().unwrap().is_empty());
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_maps_source_error() {
+        let ds = MockVaultChangesDataSource {
+            error: Some(ApiError::Internal("db".into())),
+            ..Default::default()
+        };
+        let err = process_get_vault_changes(&ds, 8453, &ORDERBOOK.to_string(), VAULT, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
+
+    #[rocket::async_test]
+    async fn vault_changes_route_is_mounted_and_requires_auth() {
+        let client = crate::test_helpers::TestClientBuilder::new().build().await;
+        for version in ["v1", "v2"] {
+            let response = client
+                .get(format!(
+                    "/{version}/vaults/8453/{ORDERBOOK}/{VAULT}/changes"
+                ))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), rocket::http::Status::Unauthorized);
+        }
     }
 
     #[rocket::async_test]
