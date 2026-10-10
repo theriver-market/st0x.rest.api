@@ -168,3 +168,35 @@ pub struct VaultChangesResponse {
     /// Newest first.
     pub changes: Vec<VaultChangeResponse>,
 }
+
+/// One vault of an owner with all its balance changes.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerVaultChangesEntry {
+    /// Vault id as returned by /v2/vaults (`id`, hex); the per-vault changes route key.
+    #[schema(
+        example = "0xe522cb4a5fcb2eb31a52ff41a4653d85a4fd7c9d1111111111111111111111111111111111111111833589fcd6edb6e08f4c7c32d4f71b54bda02913ab0f000000000000000000000000000000000000000000000000000000000000"
+    )]
+    pub id: String,
+    /// On-chain vault id (decimal), as /v2/vaults `vaultId`.
+    #[schema(example = "4011")]
+    pub vault_id: String,
+    #[schema(example = "0xe522cb4a5fcb2eb31a52ff41a4653d85a4fd7c9d")]
+    pub orderbook: String,
+    #[schema(example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
+    pub token: String,
+    #[schema(example = 6)]
+    pub decimals: u8,
+    /// Newest first; same rows as /v2/vaults/{chain_id}/{raindex}/{id}/changes.
+    pub changes: Vec<VaultChangeResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerVaultChangesResponse {
+    #[schema(example = 8453)]
+    pub chain_id: u32,
+    #[schema(example = "0x1111111111111111111111111111111111111111")]
+    pub owner: String,
+    pub vaults: Vec<OwnerVaultChangesEntry>,
+}

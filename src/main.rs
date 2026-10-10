@@ -252,6 +252,7 @@ enum StartupRegistryError {
         routes::vaults::get_vaults,
         routes::vaults::get_vault_totals,
         routes::vaults::get_vault_changes,
+        routes::owners::get_owner_vault_changes,
         routes::admin::put_registry,
         routes::attribution_admin::get_attributed_executions,
         routes::attribution_admin::get_attribution_volume,
@@ -366,6 +367,8 @@ pub(crate) fn rocket(
         .mount("/v2/orders", routes::orders::routes_v2())
         .mount("/v1/vaults", routes::vaults::routes())
         .mount("/v2/vaults", routes::vaults::routes_v2())
+        .mount("/v1/owners", routes::owners::routes())
+        .mount("/v2/owners", routes::owners::routes())
         .mount("/v1/trades", routes::trades::routes())
         .mount("/v2/trades", routes::trades::routes_v2())
         .mount("/", routes::registry::routes())

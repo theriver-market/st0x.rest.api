@@ -4,6 +4,7 @@ pub(crate) mod batch_query;
 pub mod health;
 pub mod order;
 pub mod orders;
+pub mod owners;
 pub mod prices;
 pub mod registry;
 pub mod swap;

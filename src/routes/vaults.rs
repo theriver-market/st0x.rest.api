@@ -107,7 +107,7 @@ impl VaultsDataSource for RaindexVaultsDataSource<'_> {
     }
 }
 
-fn vault_record_from_sdk(vault: RaindexVault) -> Result<VaultRecord, ApiError> {
+pub(crate) fn vault_record_from_sdk(vault: RaindexVault) -> Result<VaultRecord, ApiError> {
     let token = vault.token();
     let decimals = token.decimals();
     let balance = vault
@@ -150,7 +150,7 @@ fn vault_record_from_sdk(vault: RaindexVault) -> Result<VaultRecord, ApiError> {
     })
 }
 
-fn parse_address(value: &str, field: &str) -> Result<Address, ApiError> {
+pub(crate) fn parse_address(value: &str, field: &str) -> Result<Address, ApiError> {
     value.parse::<Address>().map_err(|error| {
         tracing::warn!(field, value, error = %error, "invalid address query parameter");
         ApiError::BadRequest(format!("{field} must be a valid address"))
@@ -444,34 +444,41 @@ impl VaultChangesDataSource for RaindexVaultsDataSource<'_> {
                 return Ok(None);
             }
         };
-        let decimals = vault.token().decimals();
-        let changes = vault
-            .get_balance_changes(Some(page), None)
-            .await
-            .map_err(|error| {
-                tracing::error!(error = %error, chain_id, "failed to read vault changes");
-                ApiError::Internal("failed to read vault changes".into())
-            })?;
-        Ok(Some(
-            changes
-                .into_iter()
-                .map(|change| {
-                    let tx = change.transaction();
-                    VaultChangeRecord {
-                        change_type: change.r#type(),
-                        amount: change.amount(),
-                        old_balance: change.old_balance(),
-                        new_balance: change.new_balance(),
-                        token: change.token().address(),
-                        decimals,
-                        timestamp: change.timestamp().try_into().unwrap_or(u64::MAX),
-                        tx_hash: tx.id(),
-                        sender: tx.from(),
-                    }
-                })
-                .collect(),
-        ))
+        Ok(Some(sdk_vault_change_records(&vault, Some(page)).await?))
     }
+}
+
+/// Reads one vault's balance changes through the SDK (local DB or subgraph, as the
+/// SDK routes the chain) and maps them to `VaultChangeRecord`s.
+pub(crate) async fn sdk_vault_change_records(
+    vault: &RaindexVault,
+    page: Option<u16>,
+) -> Result<Vec<VaultChangeRecord>, ApiError> {
+    let decimals = vault.token().decimals();
+    let changes = vault
+        .get_balance_changes(page, None)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, chain_id = vault.chain_id(), "failed to read vault changes");
+            ApiError::Internal("failed to read vault changes".into())
+        })?;
+    Ok(changes
+        .into_iter()
+        .map(|change| {
+            let tx = change.transaction();
+            VaultChangeRecord {
+                change_type: change.r#type(),
+                amount: change.amount(),
+                old_balance: change.old_balance(),
+                new_balance: change.new_balance(),
+                token: change.token().address(),
+                decimals,
+                timestamp: change.timestamp().try_into().unwrap_or(u64::MAX),
+                tx_hash: tx.id(),
+                sender: tx.from(),
+            }
+        })
+        .collect())
 }
 
 fn change_type_key(change_type: &RaindexVaultBalanceChangeType) -> &'static str {
@@ -510,6 +517,24 @@ fn raw_units(v: Float, decimals: u8, what: &str) -> Result<String, ApiError> {
     })
 }
 
+/// One change row in the public shape: raw signed token units, machine + display type.
+pub(crate) fn vault_change_response(
+    record: VaultChangeRecord,
+) -> Result<VaultChangeResponse, ApiError> {
+    Ok(VaultChangeResponse {
+        change_type: change_type_key(&record.change_type).to_string(),
+        kind: record.change_type.display_name().to_string(),
+        amount: raw_units(record.amount, record.decimals, "amount")?,
+        old_balance: raw_units(record.old_balance, record.decimals, "old_balance")?,
+        new_balance: raw_units(record.new_balance, record.decimals, "new_balance")?,
+        token: record.token.to_string(),
+        decimals: record.decimals,
+        timestamp: record.timestamp,
+        tx_hash: record.tx_hash.to_string(),
+        sender: record.sender.to_string(),
+    })
+}
+
 pub(crate) async fn process_get_vault_changes(
     ds: &dyn VaultChangesDataSource,
     chain_id: u32,
@@ -531,20 +556,7 @@ pub(crate) async fn process_get_vault_changes(
     records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     let changes = records
         .into_iter()
-        .map(|record| {
-            Ok(VaultChangeResponse {
-                change_type: change_type_key(&record.change_type).to_string(),
-                kind: record.change_type.display_name().to_string(),
-                amount: raw_units(record.amount, record.decimals, "amount")?,
-                old_balance: raw_units(record.old_balance, record.decimals, "old_balance")?,
-                new_balance: raw_units(record.new_balance, record.decimals, "new_balance")?,
-                token: record.token.to_string(),
-                decimals: record.decimals,
-                timestamp: record.timestamp,
-                tx_hash: record.tx_hash.to_string(),
-                sender: record.sender.to_string(),
-            })
-        })
+        .map(vault_change_response)
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(VaultChangesResponse {
         chain_id,
