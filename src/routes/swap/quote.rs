@@ -433,7 +433,10 @@ pub(super) async fn process_swap_quote_v2(
         )
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
-    super::exclude_orders_owned_by(&mut candidates, req.user);
+    super::exclude_orders_owned_by(
+        &mut candidates,
+        super::user_for_selection(chain_id, req.taker, req.user),
+    );
     if candidates.is_empty() {
         return Err(failures
             .oracle_unavailable_error()

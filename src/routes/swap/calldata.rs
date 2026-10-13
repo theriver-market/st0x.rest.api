@@ -578,8 +578,8 @@ pub(super) async fn process_swap_calldata_v2(
     })
 }
 
-/// Candidates for the pair, without orders owned by `user`, and how many of
-/// those were left out.
+/// Candidates for the pair and how many were left out for being owned by
+/// `user`, which only happens when `taker` is the executor.
 async fn build_calldata_candidates(
     ds: &dyn SwapDataSource,
     chain_id: u32,
@@ -603,20 +603,10 @@ async fn build_calldata_candidates(
         .build_candidates_for_pair(&orders, input_token, output_token, taker)
         .await
         .map_err(map_calldata_boundary_error)?;
-    let own_order_count = super::exclude_orders_owned_by(&mut candidates, user);
-    // Only calldata for the executor is built here, from these candidates.
-    // For any other taker the SDK selects the orders itself and cannot be
-    // told to leave one out, so refuse before the caller approves anything.
-    if own_order_count > 0 && !super::is_executor_taker(chain_id, taker) {
-        tracing::warn!(
-            own_order_count,
-            %taker,
-            "swap calldata rejected: user's own orders cannot be left out for this taker"
-        );
-        return Err(ApiError::BadRequest(
-            "user has orders on this pair, which can only be left out when taker is the executor contract".into(),
-        ));
-    }
+    let own_order_count = super::exclude_orders_owned_by(
+        &mut candidates,
+        super::user_for_selection(chain_id, Some(taker), user),
+    );
     // Executable candidates win in a mixed book: an order whose oracle can't be
     // fetched can't be taken, so it can't make the user's price worse.
     if candidates.is_empty() {

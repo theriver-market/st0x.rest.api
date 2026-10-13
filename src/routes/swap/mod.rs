@@ -752,6 +752,21 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
     }
 }
 
+/// The `user` whose own orders are left out of selection, if any.
+///
+/// Only for the executor: there the API builds the calldata itself and the
+/// trade pays the interface fee. For any other taker the SDK selects the
+/// orders for the calldata and cannot be told to leave one out, so `user`
+/// deliberately changes nothing, in the quote as well, to keep the two in
+/// agreement. Nobody is refused a trade for having an order on the pair.
+pub(crate) fn user_for_selection(
+    chain_id: u32,
+    taker: Option<Address>,
+    user: Option<Address>,
+) -> Option<Address> {
+    user.filter(|_| taker.is_some_and(|taker| is_executor_taker(chain_id, taker)))
+}
+
 /// Removes candidates whose order is owned by `user`, the person the trade is
 /// for, and returns how many were removed. A hard exclusion, applied before
 /// any selection or simulation, so such an order cannot come back in a later

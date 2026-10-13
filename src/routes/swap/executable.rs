@@ -287,10 +287,10 @@ mod tests {
     use super::*;
     use crate::error::ApiError;
     use crate::routes::swap::calldata::process_swap_calldata_v2;
-    use crate::routes::swap::exclude_orders_owned_by;
     use crate::routes::swap::quote::process_swap_quote_v2;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::routes::swap::SwapCandidateBuild;
+    use crate::routes::swap::{exclude_orders_owned_by, user_for_selection};
     use crate::test_helpers::{mock_candidate, mock_order};
     use crate::types::swap::{
         SwapCalldataMode, SwapCalldataResponse, SwapCalldataV2Request, SwapDenomination,
@@ -798,8 +798,8 @@ mod tests {
         let mut ds = SimulatingDataSource::new(vec![]);
         ds.base.candidates = vec![own.clone(), candidate(2, "5", "2")];
 
-        // Taker is a different address (the executor's role); the user is named.
-        let mut request = quote_request(Some(TAKER), "3");
+        // Taker is the executor, not the user; the user is named.
+        let mut request = quote_request(Some(crate::river_takes::RIVER_TAKER_BASE), "3");
         request.user = Some(USER);
         let response = process_swap_quote_v2(&ds, request).await.unwrap();
         assert_eq!(response.estimated_input, "6");
@@ -814,9 +814,12 @@ mod tests {
         assert_eq!(*ds.calls.lock().unwrap(), vec![(1, true)]);
 
         // Without the field the cheaper order is selected, as before.
-        let response = process_swap_quote_v2(&ds, quote_request(Some(TAKER), "3"))
-            .await
-            .unwrap();
+        let response = process_swap_quote_v2(
+            &ds,
+            quote_request(Some(crate::river_takes::RIVER_TAKER_BASE), "3"),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.estimated_input, "3");
     }
 
@@ -826,7 +829,7 @@ mod tests {
         let mut ds = SimulatingDataSource::new(vec![2]);
         ds.base.candidates = vec![own.clone(), candidate(2, "5", "2")];
 
-        let mut request = quote_request(Some(TAKER), "3");
+        let mut request = quote_request(Some(crate::river_takes::RIVER_TAKER_BASE), "3");
         request.user = Some(USER);
         let response = process_swap_quote_v2(&ds, request).await.unwrap();
 
@@ -850,7 +853,7 @@ mod tests {
         let mut ds = SimulatingDataSource::new(vec![]);
         ds.base.candidates = vec![owned_by(USER, candidate(1, "5", "1"))];
 
-        let mut request = quote_request(Some(TAKER), "3");
+        let mut request = quote_request(Some(crate::river_takes::RIVER_TAKER_BASE), "3");
         request.user = Some(USER);
         assert!(matches!(
             process_swap_quote_v2(&ds, request).await,
@@ -916,26 +919,70 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn calldata_for_another_taker_is_refused_when_the_user_has_orders_on_the_pair() {
+    async fn user_changes_nothing_when_the_taker_is_not_the_executor() {
+        let own = owned_by(USER, candidate(1, "5", "1"));
         let mut ds = SimulatingDataSource::new(vec![]);
-        ds.base.candidates = vec![
-            owned_by(USER, candidate(1, "5", "1")),
-            candidate(2, "5", "2"),
-        ];
+        ds.base.candidates = vec![own.clone(), candidate(2, "5", "2")];
+        let sdk_calldata = SwapCalldataResponse {
+            chain_id: 8453,
+            to: own.raindex,
+            data: Bytes::from(vec![0xab, 0xcd]),
+            value: U256::ZERO,
+            estimated_input: "3".to_string(),
+            denomination: SwapDenomination::Wrapped,
+            approvals: vec![],
+        };
+        ds.base.calldata_result = Ok(sdk_calldata.clone());
 
-        // Refused before the SDK is asked (and so before any approval).
-        assert!(matches!(
-            process_swap_calldata_v2(&ds, calldata_request(USER, Some(USER))).await,
-            Err(ApiError::BadRequest(_))
-        ));
-        // A user with no orders on the pair is unaffected.
-        assert!(matches!(
-            process_swap_calldata_v2(&ds, calldata_request(TAKER, Some(TAKER))).await,
-            Err(ApiError::Coded {
-                code: crate::error::ApiErrorCode::SwapCalldataFailed,
-                ..
-            })
-        ));
+        // The user takes directly (taker is their own wallet) or through
+        // some other address: the SDK builds that calldata and may select
+        // the user's own order, so the quote must not leave it out either.
+        for taker in [USER, TAKER] {
+            let mut named = quote_request(Some(taker), "3");
+            named.user = Some(USER);
+            let named = process_swap_quote_v2(&ds, named).await.unwrap();
+            let unnamed = process_swap_quote_v2(&ds, quote_request(Some(taker), "3"))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&named).unwrap(),
+                serde_json::to_value(&unnamed).unwrap()
+            );
+            // The cheaper order, the user's own, is still the one quoted.
+            assert_eq!(named.estimated_input, "3");
+
+            let named = process_swap_calldata_v2(&ds, calldata_request(taker, Some(USER)))
+                .await
+                .unwrap()
+                .calldata;
+            let unnamed = process_swap_calldata_v2(&ds, calldata_request(taker, None))
+                .await
+                .unwrap()
+                .calldata;
+            assert_eq!(named.data, sdk_calldata.data);
+            assert_eq!(named.data, unnamed.data);
+            assert_eq!(named.estimated_input, unnamed.estimated_input);
+        }
+
+        // A quote with no taker cannot be for the executor either.
+        let mut no_taker = quote_request(None, "3");
+        no_taker.user = Some(USER);
+        let no_taker = process_swap_quote_v2(&ds, no_taker).await.unwrap();
+        assert_eq!(no_taker.estimated_input, "3");
+    }
+
+    #[test]
+    fn user_only_counts_for_selection_when_the_taker_is_the_executor() {
+        let executor = crate::river_takes::RIVER_TAKER_BASE;
+        assert_eq!(
+            user_for_selection(8453, Some(executor), Some(USER)),
+            Some(USER)
+        );
+        assert_eq!(user_for_selection(8453, Some(executor), None), None);
+        assert_eq!(user_for_selection(8453, Some(USER), Some(USER)), None);
+        assert_eq!(user_for_selection(8453, None, Some(USER)), None);
+        // The executor is pinned on Base only.
+        assert_eq!(user_for_selection(1, Some(executor), Some(USER)), None);
     }
 
     /// Simulates at a fixed block through the production simulation code.
