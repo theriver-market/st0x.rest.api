@@ -222,7 +222,7 @@ pub(crate) async fn fetch_owner_vault_changes_local(
     group_rows(rows)
 }
 
-async fn open_local_db(path: &Path) -> Result<SqlitePool, sqlx::Error> {
+pub(crate) async fn open_local_db(path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .read_only(true)
