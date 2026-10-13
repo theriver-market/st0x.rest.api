@@ -58,6 +58,13 @@ pub struct SwapQuoteV2Request {
     /// building their signed context.
     #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Option<Address>,
+    /// The person the trade is for, when that is not `taker` (for example
+    /// when `taker` is an executor contract acting for a wallet). Orders
+    /// owned by this address are never selected: nobody is routed into
+    /// their own order. Omit it and no order is left out by ownership.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub user: Option<Address>,
     /// Token the taker will spend.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
@@ -128,6 +135,13 @@ pub struct SwapQuoteV2RequestCommon {
     /// orders, whose signed context can depend on the taker.
     #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Option<Address>,
+    /// The person the trade is for, when that is not `taker` (for example
+    /// when `taker` is an executor contract acting for a wallet). Orders
+    /// owned by this address are never selected: nobody is routed into
+    /// their own order. Omit it and no order is left out by ownership.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub user: Option<Address>,
     /// Token the taker will spend.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
@@ -339,6 +353,13 @@ pub struct SwapCalldataV2Request {
     /// Wallet that will execute the swap and whose allowance is checked.
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
+    /// The person the trade is for, when that is not `taker` (for example
+    /// when `taker` is an executor contract acting for a wallet). Orders
+    /// owned by this address are never selected: nobody is routed into
+    /// their own order. Omit it and no order is left out by ownership.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub user: Option<Address>,
     /// Token the taker will spend.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
@@ -404,6 +425,13 @@ pub struct SwapCalldataV2RequestCommon {
     /// Wallet that will execute the swap and whose allowance is checked.
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
+    /// The person the trade is for, when that is not `taker` (for example
+    /// when `taker` is an executor contract acting for a wallet). Orders
+    /// owned by this address are never selected: nobody is routed into
+    /// their own order. Omit it and no order is left out by ownership.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub user: Option<Address>,
     /// Token the taker will spend.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,

@@ -286,12 +286,15 @@ pub(crate) async fn resolve_executable_take(
 mod tests {
     use super::*;
     use crate::error::ApiError;
+    use crate::routes::swap::calldata::process_swap_calldata_v2;
+    use crate::routes::swap::exclude_orders_owned_by;
     use crate::routes::swap::quote::process_swap_quote_v2;
     use crate::routes::swap::test_fixtures::MockSwapDataSource;
     use crate::routes::swap::SwapCandidateBuild;
     use crate::test_helpers::{mock_candidate, mock_order};
     use crate::types::swap::{
-        SwapCalldataMode, SwapCalldataResponse, SwapDenomination, SwapQuoteV2Request,
+        SwapCalldataMode, SwapCalldataResponse, SwapCalldataV2Request, SwapDenomination,
+        SwapQuoteV2Request,
     };
     use alloy::primitives::U256;
     use alloy::sol_types::{Revert, SolCall, SolError};
@@ -613,6 +616,7 @@ mod tests {
         SwapQuoteV2Request {
             chain_id: Some(8453),
             taker,
+            user: None,
             input_token: Address::repeat_byte(4),
             output_token: Address::repeat_byte(5),
             mode: SwapCalldataMode::BuyUpTo,
@@ -699,6 +703,239 @@ mod tests {
             body["takeSimulation"],
             json!({"status": "notSimulated", "reason": "rpcUnavailable", "excludedOrders": []})
         );
+    }
+
+    const USER: Address = Address::repeat_byte(0x22);
+
+    fn owned_by(owner: Address, mut candidate: TakeOrderCandidate) -> TakeOrderCandidate {
+        candidate.order.owner = owner;
+        candidate
+    }
+
+    fn calldata_request(taker: Address, user: Option<Address>) -> SwapCalldataV2Request {
+        SwapCalldataV2Request {
+            chain_id: Some(8453),
+            taker,
+            user,
+            input_token: Address::repeat_byte(4),
+            output_token: Address::repeat_byte(5),
+            mode: SwapCalldataMode::BuyUpTo,
+            amount: "3".to_string(),
+            price_cap: Some("10".to_string()),
+            slippage_bps: None,
+            reference_io_ratio: None,
+            denomination: SwapDenomination::Wrapped,
+        }
+    }
+
+    fn order_hashes(calldata: &SwapCalldataResponse) -> Vec<B256> {
+        takeOrders4Call::abi_decode(&calldata.data)
+            .unwrap()
+            .config
+            .orders
+            .iter()
+            .map(|order| keccak256(order.order.abi_encode()))
+            .collect()
+    }
+
+    #[test]
+    fn user_field_is_optional_and_parsed_like_taker() {
+        let body = |user: serde_json::Value| {
+            let mut body = json!({
+                "chainId": 8453,
+                "taker": TAKER,
+                "inputToken": Address::repeat_byte(4),
+                "outputToken": Address::repeat_byte(5),
+                "mode": "buyUpTo",
+                "amount": "3",
+                "priceCap": "10",
+            });
+            if !user.is_null() {
+                body["user"] = user;
+            }
+            body
+        };
+
+        let absent: SwapQuoteV2Request = serde_json::from_value(body(json!(null))).unwrap();
+        assert_eq!(absent.user, None);
+        assert_eq!(absent.taker, Some(TAKER));
+        let present: SwapQuoteV2Request = serde_json::from_value(body(json!(USER))).unwrap();
+        assert_eq!(present.user, Some(USER));
+        assert_eq!(present.taker, Some(TAKER));
+        assert!(serde_json::from_value::<SwapQuoteV2Request>(body(json!("0x1234"))).is_err());
+
+        let absent: SwapCalldataV2Request = serde_json::from_value(body(json!(null))).unwrap();
+        assert_eq!(absent.user, None);
+        let present: SwapCalldataV2Request = serde_json::from_value(body(json!(USER))).unwrap();
+        assert_eq!(present.user, Some(USER));
+        assert_eq!(present.taker, TAKER);
+        assert!(serde_json::from_value::<SwapCalldataV2Request>(body(json!("0x1234"))).is_err());
+    }
+
+    #[test]
+    fn orders_owned_by_the_user_are_removed_and_counted() {
+        let own = owned_by(USER, candidate(1, "5", "1"));
+        let other = candidate(2, "5", "2");
+        let also_own = owned_by(USER, candidate(3, "5", "3"));
+
+        let mut candidates = vec![own.clone(), other.clone(), also_own];
+        assert_eq!(exclude_orders_owned_by(&mut candidates, Some(USER)), 2);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(order_hash(&candidates[0]), order_hash(&other));
+
+        // No user named: nothing is left out by ownership, as before.
+        let mut candidates = vec![own, other];
+        assert_eq!(exclude_orders_owned_by(&mut candidates, None), 0);
+        assert_eq!(candidates.len(), 2);
+        // The taker is not the user: owning nothing, it removes nothing.
+        assert_eq!(exclude_orders_owned_by(&mut candidates, Some(TAKER)), 0);
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[rocket::async_test]
+    async fn quote_never_selects_the_users_own_order_even_at_the_better_price() {
+        let own = owned_by(USER, candidate(1, "5", "1"));
+        let mut ds = SimulatingDataSource::new(vec![]);
+        ds.base.candidates = vec![own.clone(), candidate(2, "5", "2")];
+
+        // Taker is a different address (the executor's role); the user is named.
+        let mut request = quote_request(Some(TAKER), "3");
+        request.user = Some(USER);
+        let response = process_swap_quote_v2(&ds, request).await.unwrap();
+        assert_eq!(response.estimated_input, "6");
+        assert_eq!(response.estimated_output, "3");
+        assert!(response.fully_filled);
+        assert_eq!(
+            response.take_simulation.status,
+            TakeSimulationStatus::Executes
+        );
+        // Left out before selection: never simulated, so not "excluded" either.
+        assert!(response.take_simulation.excluded_orders.is_empty());
+        assert_eq!(*ds.calls.lock().unwrap(), vec![(1, true)]);
+
+        // Without the field the cheaper order is selected, as before.
+        let response = process_swap_quote_v2(&ds, quote_request(Some(TAKER), "3"))
+            .await
+            .unwrap();
+        assert_eq!(response.estimated_input, "3");
+    }
+
+    #[rocket::async_test]
+    async fn own_order_does_not_come_back_when_the_other_orders_revert() {
+        let own = owned_by(USER, candidate(1, "5", "1"));
+        let mut ds = SimulatingDataSource::new(vec![2]);
+        ds.base.candidates = vec![own.clone(), candidate(2, "5", "2")];
+
+        let mut request = quote_request(Some(TAKER), "3");
+        request.user = Some(USER);
+        let response = process_swap_quote_v2(&ds, request).await.unwrap();
+
+        // The only other order reverts. The search must end there rather than
+        // fall back to the user's own order.
+        assert_eq!(
+            response.take_simulation.status,
+            TakeSimulationStatus::Reverts
+        );
+        assert!(!response.fully_filled);
+        assert_eq!(response.take_simulation.excluded_orders.len(), 1);
+        assert_ne!(
+            response.take_simulation.excluded_orders[0].order_hash,
+            order_hash(&own)
+        );
+        assert_eq!(*ds.calls.lock().unwrap(), vec![(1, true)]);
+    }
+
+    #[rocket::async_test]
+    async fn quote_with_only_the_users_own_orders_has_no_liquidity() {
+        let mut ds = SimulatingDataSource::new(vec![]);
+        ds.base.candidates = vec![owned_by(USER, candidate(1, "5", "1"))];
+
+        let mut request = quote_request(Some(TAKER), "3");
+        request.user = Some(USER);
+        assert!(matches!(
+            process_swap_quote_v2(&ds, request).await,
+            Err(ApiError::Coded {
+                code: crate::error::ApiErrorCode::SwapNoLiquidity,
+                ..
+            })
+        ));
+        assert!(ds.calls.lock().unwrap().is_empty());
+    }
+
+    #[rocket::async_test]
+    async fn executor_calldata_leaves_out_the_users_own_order() {
+        let executor = crate::river_takes::RIVER_TAKER_BASE;
+        let own = owned_by(USER, candidate(1, "5", "1"));
+        let other = candidate(2, "5", "2");
+        let mut ds = SimulatingDataSource::new(vec![]);
+        ds.base.candidates = vec![own.clone(), other.clone()];
+
+        let calldata = process_swap_calldata_v2(&ds, calldata_request(executor, Some(USER)))
+            .await
+            .unwrap()
+            .calldata;
+        assert_eq!(order_hashes(&calldata), vec![order_hash(&other)]);
+        assert_eq!(calldata.to, other.raindex);
+        assert_eq!(calldata.estimated_input, "6");
+        assert!(calldata.approvals.is_empty());
+
+        // With no simulation answer the SDK must still not be asked: it
+        // would select from candidates that include the user's own order.
+        ds.unavailable = true;
+        let calldata = process_swap_calldata_v2(&ds, calldata_request(executor, Some(USER)))
+            .await
+            .unwrap()
+            .calldata;
+        assert_eq!(order_hashes(&calldata), vec![order_hash(&other)]);
+
+        // No user named and nothing reverting: the SDK path is used (the
+        // mock's SDK result is an error, mapped at the boundary).
+        ds.unavailable = false;
+        assert!(matches!(
+            process_swap_calldata_v2(&ds, calldata_request(executor, None)).await,
+            Err(ApiError::Coded {
+                code: crate::error::ApiErrorCode::SwapCalldataFailed,
+                ..
+            })
+        ));
+    }
+
+    #[rocket::async_test]
+    async fn executor_calldata_with_only_the_users_own_orders_has_no_liquidity() {
+        let executor = crate::river_takes::RIVER_TAKER_BASE;
+        let mut ds = SimulatingDataSource::new(vec![]);
+        ds.base.candidates = vec![owned_by(USER, candidate(1, "5", "1"))];
+
+        assert!(matches!(
+            process_swap_calldata_v2(&ds, calldata_request(executor, Some(USER))).await,
+            Err(ApiError::Coded {
+                code: crate::error::ApiErrorCode::SwapNoLiquidity,
+                ..
+            })
+        ));
+    }
+
+    #[rocket::async_test]
+    async fn calldata_for_another_taker_is_refused_when_the_user_has_orders_on_the_pair() {
+        let mut ds = SimulatingDataSource::new(vec![]);
+        ds.base.candidates = vec![
+            owned_by(USER, candidate(1, "5", "1")),
+            candidate(2, "5", "2"),
+        ];
+
+        // Refused before the SDK is asked (and so before any approval).
+        assert!(matches!(
+            process_swap_calldata_v2(&ds, calldata_request(USER, Some(USER))).await,
+            Err(ApiError::BadRequest(_))
+        ));
+        // A user with no orders on the pair is unaffected.
+        assert!(matches!(
+            process_swap_calldata_v2(&ds, calldata_request(TAKER, Some(TAKER))).await,
+            Err(ApiError::Coded {
+                code: crate::error::ApiErrorCode::SwapCalldataFailed,
+                ..
+            })
+        ));
     }
 
     /// Simulates at a fixed block through the production simulation code.
@@ -981,6 +1218,41 @@ mod tests {
                     println!(
                         "search: {}",
                         serde_json::to_string(&resolved.take_simulation).unwrap()
+                    );
+
+                    // The same, with the user's own orders left out first, as
+                    // a request naming `user` does.
+                    let mut not_own = candidates.clone();
+                    let own_order_count = exclude_orders_owned_by(&mut not_own, Some(user));
+                    let first_not_own = SimulationResult {
+                        legs: first
+                            .legs
+                            .iter()
+                            .filter(|leg| leg.candidate.order.owner != user)
+                            .cloned()
+                            .collect(),
+                        ..first.clone()
+                    };
+                    let resolved_not_own = resolve_executable_take(
+                        &ReplayDataSource {
+                            rpcs: rpcs.to_vec(),
+                            block: *block,
+                        },
+                        ExecutableTakeRequest {
+                            chain_id: 8453,
+                            taker: executor,
+                            input_token,
+                            mode,
+                            price_cap,
+                        },
+                        not_own.clone(),
+                        first_not_own,
+                    )
+                    .await;
+                    println!(
+                        "search with user={user}: own orders left out={own_order_count} candidates={:?} result={}",
+                        not_own.iter().map(order_hash).collect::<Vec<_>>(),
+                        serde_json::to_string(&resolved_not_own.take_simulation).unwrap()
                     );
 
                     // The site's outer call for the route the search ends with.

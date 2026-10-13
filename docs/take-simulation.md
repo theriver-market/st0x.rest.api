@@ -60,6 +60,52 @@ apart; the whole search has 8 seconds. Worst case is 4 x (1 batch + 2 funding
 read-backs + 12 legs) + 2 layout probes = 62 `eth_call`s. The normal case, a
 batch that executes for a token seen before, is 1.
 
+## Taker and user
+
+Two addresses describe a swap:
+
+- `taker`: the address that will call `takeOrders4`. It is the counterparty
+  orders are quoted for, the address calldata is built for, and the `from` of
+  the simulation. Unchanged.
+- `user` (new, optional, `/v2` and `/v3` quote and calldata): the person the
+  trade is for. Orders owned by `user` are not candidates.
+
+They differ whenever an executor contract takes on someone's behalf: the site
+sends `taker` = RiverTaker, so nothing keyed on `taker` can know whose trade
+it is.
+
+Before this change nothing left out a person's own orders. The SDK counter
+named `skipped_self_trade_pair_count` counts order pairs whose input and
+output *token* are the same; neither the SDK nor the API compared an order's
+owner with the taker, and `takeOrders4` accepts a taker who owns the order.
+In the 13 Oct incident the wallet's sell was routed into the wallet's own buy
+order. So the rule is new, and it applies only when `user` is sent: without
+it, selection is exactly what it was.
+
+It is a hard exclusion, not something left to the simulation. A take of your
+own order executes perfectly well, so a simulation would never object, and it
+moves your own tokens between your wallet and your vault while paying the
+interface fee. The filter (`exclude_orders_owned_by`) runs on the candidate
+list before any selection:
+
+- quote: before selection, slippage resolution and the simulation search. The
+  search only ever re-selects from that list, so an order left out by
+  ownership cannot return in a later round, even when every other order
+  reverts. If nothing else is on the book the quote is `SWAP_NO_LIQUIDITY`.
+- calldata, `taker` = RiverTaker: before slippage resolution and the search.
+  If any order of the user's was left out, the calldata is always built here
+  from the remaining selection, also when the simulation gave no answer,
+  because the SDK selects from its own candidates and would bring the order
+  back.
+- calldata, any other `taker`: the SDK builds this calldata and cannot be
+  told to leave an order out. If `user` has orders among the candidates the
+  request is refused with 400 before anything is approved. With no such
+  orders, or without `user`, nothing changes. Closing this needs a candidate
+  filter in the SDK's take-orders path.
+
+A malformed `user` is rejected exactly like a malformed `taker` (422, same
+body).
+
 ## When
 
 - **Quote** (`POST /v2|v3/swap/quote`) whenever the request names a `taker`.
@@ -261,17 +307,24 @@ they depend on taker, amount and block.
 
 ## What the website must change
 
-1. Send `taker` on quote requests as the address that will call
+1. On quote requests send `taker` as the address that will call
    `takeOrders4`: the RiverTaker address when RiverTaker execution is enabled
    (the address already sent to `/v3/swap/calldata`), otherwise the connected
    wallet. Today quotes carry the wallet while calldata carries RiverTaker.
-   With RiverTaker enabled the quote can be simulated before a wallet
-   connects.
-2. Add `takeSimulation` to `ApiSwapQuoteV3Response`.
-3. `status === 'reverts'`: do not offer the Raindex route for this amount.
+2. On quote and calldata requests send `user` = the connected wallet whenever
+   one is connected. With RiverTaker this is what keeps a person out of their
+   own orders, and it must be on both requests so quote and calldata agree.
+   With no wallet connected, omit `user`; the quote is still simulated for
+   `taker` = RiverTaker.
+3. Add `user?: string` to the quote and calldata request types and
+   `takeSimulation` to `ApiSwapQuoteV3Response`.
+4. `status === 'reverts'`: do not offer the Raindex route for this amount.
    `fullyFilled` is already `false`. `excludedOrders[].revertReason` and
    `revertData` may be logged or shown verbatim; do not branch on them.
-4. `status === 'notSimulated'`: behave as today.
-5. `status === 'executes'`: nothing to do; the estimates already leave out
+5. `status === 'notSimulated'`: behave as today.
+6. `status === 'executes'`: nothing to do; the estimates already leave out
    `excludedOrders`.
-6. Keep the pre-send simulation of the final transaction.
+7. `SWAP_NO_LIQUIDITY` now also comes from a quote when the only liquidity is
+   the user's own orders, and from RiverTaker calldata when it is the user's
+   own orders or orders that revert.
+8. Keep the pre-send simulation of the final transaction.

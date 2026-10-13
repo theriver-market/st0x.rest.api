@@ -541,6 +541,7 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
     let v2_request = SwapCalldataV2Request {
         chain_id: Some(8453),
         taker: owner,
+        user: None,
         input_token: input_address,
         output_token: output_address,
         mode: SwapCalldataMode::BuyUpTo,
@@ -778,6 +779,7 @@ async fn test_quote_take_simulation_excludes_order_whose_handle_io_rejects_the_t
     let quote = |taker: Option<Address>, amount: &str| SwapQuoteV2Request {
         chain_id: Some(8453),
         taker,
+        user: None,
         input_token: input_address,
         output_token: output_address,
         mode: SwapCalldataMode::BuyUpTo,
@@ -857,6 +859,7 @@ async fn test_quote_take_simulation_excludes_order_whose_handle_io_rejects_the_t
     let calldata = |amount: &str| SwapCalldataV2Request {
         chain_id: Some(8453),
         taker: executor,
+        user: None,
         input_token: input_address,
         output_token: output_address,
         mode: SwapCalldataMode::BuyUpTo,
@@ -927,6 +930,66 @@ async fn test_quote_take_simulation_excludes_order_whose_handle_io_rejects_the_t
     assert!(!partial.fully_filled);
     assert_eq!(partial.estimated_output, "200");
     assert_eq!(partial.estimated_input, "500");
+
+    // The end user has an order of their own on the pair, at the best price.
+    // Trades go through the executor, so `taker` is not the user.
+    let user = local_evm.signer_wallets[1].default_signer().address();
+    output
+        .transfer(user, U256::from(10).pow(U256::from(20)))
+        .from(owner)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let (own_order, own_order_hash) =
+        add_min_trade_order(&local_evm, user, input_address, output_address, 1, 0).await;
+    *services.subgraph_order.write().await = Some(json!([own_order.clone(), plain_order.clone()]));
+    let take_hashes = |data: &Bytes| {
+        takeOrders4Call::abi_decode(data)
+            .unwrap()
+            .config
+            .orders
+            .iter()
+            .map(|order| keccak256(order.order.abi_encode()))
+            .collect::<Vec<_>>()
+    };
+
+    // Unnamed, the user's order is simply the cheapest liquidity.
+    let unnamed = process_swap_quote_v2(&data_source, quote(Some(executor), "10"))
+        .await
+        .unwrap();
+    assert_eq!(unnamed.estimated_input, "10");
+    let unnamed_calldata = process_swap_calldata_v2(&data_source, calldata("10"))
+        .await
+        .unwrap()
+        .calldata;
+    assert_eq!(take_hashes(&unnamed_calldata.data), vec![own_order_hash]);
+
+    // Named, it is not a candidate: the quote prices the other order, the
+    // take of that order executes, and nothing had to be excluded by it.
+    let mut named_quote = quote(Some(executor), "10");
+    named_quote.user = Some(user);
+    let named = process_swap_quote_v2(&data_source, named_quote)
+        .await
+        .unwrap();
+    assert_eq!(named.estimated_input, "30");
+    assert!(named.fully_filled);
+    assert_eq!(named.take_simulation.status, TakeSimulationStatus::Executes);
+    assert!(named.take_simulation.excluded_orders.is_empty());
+
+    // Quote and calldata agree.
+    let mut named_calldata = calldata("10");
+    named_calldata.user = Some(user);
+    let named_calldata = process_swap_calldata_v2(&data_source, named_calldata)
+        .await
+        .unwrap()
+        .calldata;
+    assert_eq!(named_calldata.estimated_input, "30");
+    let named_take = take_hashes(&named_calldata.data);
+    assert_eq!(named_take.len(), 1);
+    assert_ne!(named_take[0], own_order_hash);
 
     // Nothing above changed the taker's real balance or allowance.
     assert_eq!(input.balanceOf(taker).call().await.unwrap(), U256::ZERO);

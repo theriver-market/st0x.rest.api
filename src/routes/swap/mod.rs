@@ -752,6 +752,32 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
     }
 }
 
+/// Removes candidates whose order is owned by `user`, the person the trade is
+/// for, and returns how many were removed. A hard exclusion, applied before
+/// any selection or simulation, so such an order cannot come back in a later
+/// round: trading with yourself moves nothing and still pays fees. `None`
+/// removes nothing.
+pub(crate) fn exclude_orders_owned_by(
+    candidates: &mut Vec<TakeOrderCandidate>,
+    user: Option<Address>,
+) -> usize {
+    let Some(user) = user else {
+        return 0;
+    };
+    let before = candidates.len();
+    candidates.retain(|candidate| candidate.order.owner != user);
+    let excluded = before - candidates.len();
+    if excluded > 0 {
+        tracing::info!(
+            %user,
+            own_order_count = excluded,
+            candidate_count = candidates.len(),
+            "left out swap candidates owned by the user"
+        );
+    }
+    excluded
+}
+
 fn swap_calldata_response_from_take_orders_info(
     chain_id: u32,
     take_orders_info: &TakeOrdersInfo,

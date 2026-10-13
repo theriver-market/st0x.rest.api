@@ -422,7 +422,7 @@ pub(super) async fn process_swap_quote_v2(
     }
 
     let SwapCandidateBuild {
-        candidates,
+        mut candidates,
         failures,
     } = ds
         .build_candidates_for_pair(
@@ -433,6 +433,7 @@ pub(super) async fn process_swap_quote_v2(
         )
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
+    super::exclude_orders_owned_by(&mut candidates, req.user);
     if candidates.is_empty() {
         return Err(failures
             .oracle_unavailable_error()
@@ -748,6 +749,7 @@ mod tests {
         SwapQuoteV2Request {
             chain_id: Some(8453),
             taker: None,
+            user: None,
             input_token: USDC,
             output_token: WETH,
             mode,
@@ -1735,6 +1737,53 @@ mod tests {
         assert_eq!(body.error.message, "chainId is required");
     }
 
+    /// A malformed `user` is rejected exactly like a malformed `taker`.
+    #[rocket::async_test]
+    async fn test_v3_swap_quote_and_calldata_reject_malformed_user_like_malformed_taker() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
+        let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
+        let body = |field: &str| {
+            let mut body = serde_json::json!({
+                "chainId": 8453,
+                "taker": "0x1111111111111111111111111111111111111111",
+                "user": "0x2222222222222222222222222222222222222222",
+                "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "outputToken": "0x4200000000000000000000000000000000000006",
+                "mode": "spendExact",
+                "amount": "100",
+                "priceCap": "2500",
+            });
+            body[field] = serde_json::json!("0x1234");
+            body.to_string()
+        };
+
+        for path in ["/v3/swap/quote", "/v3/swap/calldata", "/v2/swap/quote"] {
+            let mut responses = Vec::new();
+            for field in ["taker", "user"] {
+                let response = client
+                    .post(path)
+                    .header(ContentType::JSON)
+                    .header(rocket::http::Header::new("Authorization", header.clone()))
+                    .body(body(field))
+                    .dispatch()
+                    .await;
+                assert_eq!(
+                    response.status(),
+                    Status::UnprocessableEntity,
+                    "{path} {field}"
+                );
+                let error = response
+                    .into_json::<ApiErrorResponse>()
+                    .await
+                    .unwrap()
+                    .error;
+                responses.push((error.code, error.message));
+            }
+            assert_eq!(responses[0], responses[1], "{path}");
+        }
+    }
+
     /// Read-only check against a live chain: quotes through the real data
     /// source and prints the response, take simulation included.
     ///
@@ -1765,6 +1814,9 @@ mod tests {
                 .parse()
                 .unwrap(),
             ),
+            user: std::env::var("TAKE_SIM_USER")
+                .ok()
+                .map(|user| user.parse().unwrap()),
             input_token: var(
                 "TAKE_SIM_INPUT_TOKEN",
                 "0x31c2c14134e6e3b7ef9478297f199331133fc2d8",
