@@ -294,8 +294,9 @@ mod tests {
         SwapCalldataMode, SwapCalldataResponse, SwapDenomination, SwapQuoteV2Request,
     };
     use alloy::primitives::U256;
-    use alloy::sol_types::{Revert, SolError};
+    use alloy::sol_types::{Revert, SolCall, SolError};
     use async_trait::async_trait;
+    use rain_orderbook_bindings::IRaindexV6::{quote2Call, takeOrders4Call, QuoteV2};
     use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
     use rain_orderbook_common::take_orders::TakeOrdersMode;
@@ -698,5 +699,343 @@ mod tests {
             body["takeSimulation"],
             json!({"status": "notSimulated", "reason": "rpcUnavailable", "excludedOrders": []})
         );
+    }
+
+    /// Simulates at a fixed block through the production simulation code.
+    struct ReplayDataSource {
+        rpcs: Vec<url::Url>,
+        block: alloy::eips::BlockId,
+    }
+
+    #[async_trait]
+    impl SwapDataSource for ReplayDataSource {
+        async fn validate_supported_tokens(&self, _: Address, _: Address) -> Result<(), ApiError> {
+            Err(ApiError::Internal("replay only simulates".into()))
+        }
+
+        async fn get_orders_for_pair(
+            &self,
+            _: Address,
+            _: Address,
+        ) -> Result<Vec<RaindexOrder>, ApiError> {
+            Err(ApiError::Internal("replay only simulates".into()))
+        }
+
+        async fn build_candidates_for_pair(
+            &self,
+            _: &[RaindexOrder],
+            _: Address,
+            _: Address,
+            _: Address,
+        ) -> Result<SwapCandidateBuild, ApiError> {
+            Err(ApiError::Internal("replay only simulates".into()))
+        }
+
+        async fn get_calldata(
+            &self,
+            _: TakeOrdersRequest,
+        ) -> Result<SwapCalldataResponse, ApiError> {
+            Err(ApiError::Internal("replay only simulates".into()))
+        }
+
+        async fn simulate_take(
+            &self,
+            chain_id: u32,
+            taker: Address,
+            input_token: Address,
+            raindex: Address,
+            config: &TakeOrdersConfigV5,
+            verify_funding: bool,
+        ) -> TakeOutcome {
+            crate::take_simulation::simulate_funded_call(crate::take_simulation::FundedCall {
+                rpcs: &self.rpcs,
+                chain_id,
+                block: self.block,
+                from: taker,
+                to: raindex,
+                token: input_token,
+                calldata: takeOrders4Call {
+                    config: config.clone(),
+                }
+                .abi_encode()
+                .into(),
+                verify_funding,
+            })
+            .await
+        }
+    }
+
+    /// Replays logged `/v3/swap/calldata` exchanges against chain state at
+    /// chosen blocks, read-only, and prints what happens:
+    ///
+    /// - the logged inner `takeOrders4` from the logged taker (the executor);
+    /// - the production search (`resolve_executable_take`) over the orders in
+    ///   that calldata, at the same block;
+    /// - the site's outer `RiverTaker.take` from the user's wallet.
+    ///
+    /// `TAKE_REPLAY_FILE`: JSON array of `{timestamp_utc, request, response}`.
+    /// `TAKE_REPLAY_RPCS`: comma-separated RPC URLs, each tried on its own.
+    /// `TAKE_REPLAY_BLOCKS`: comma-separated block numbers and/or `latest`.
+    /// `TAKE_REPLAY_USER`: the wallet that would have sent the transaction.
+    #[rocket::async_test]
+    #[ignore = "live: replays logged calldata against a chain RPC"]
+    async fn replay_logged_calldata() {
+        use crate::take_simulation::{simulate_funded_call, FundedCall};
+        use alloy::eips::BlockId;
+        use alloy::providers::{Provider, ProviderBuilder};
+        use rain_orderbook_common::take_orders::SelectedTakeOrderLeg;
+
+        let var = |name: &str| std::env::var(name).unwrap_or_default();
+        let exchanges: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(var("TAKE_REPLAY_FILE")).unwrap())
+                .unwrap();
+        let rpcs: Vec<url::Url> = var("TAKE_REPLAY_RPCS")
+            .split(',')
+            .map(|rpc| rpc.trim().parse().unwrap())
+            .collect();
+        let blocks: Vec<BlockId> = var("TAKE_REPLAY_BLOCKS")
+            .split(',')
+            .map(|block| match block.trim() {
+                "latest" => BlockId::latest(),
+                number => BlockId::number(number.parse().unwrap()),
+            })
+            .collect();
+        let user: Address = var("TAKE_REPLAY_USER").parse().unwrap();
+        let describe = |outcome: &TakeOutcome| match outcome {
+            TakeOutcome::Reverts(data) => {
+                format!(
+                    "REVERTS data={data} reason={:?}",
+                    decode_revert_reason(data)
+                )
+            }
+            other => format!("{other:?}"),
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        for exchange in &exchanges {
+            let (request, response) = (&exchange["request"], &exchange["response"]);
+            let data: Bytes = response["data"].as_str().unwrap().parse().unwrap();
+            if !seen.insert(data.clone()) {
+                continue;
+            }
+            let address = |value: &serde_json::Value| value.as_str().unwrap().parse::<Address>();
+            let executor = address(&request["taker"]).unwrap();
+            let raindex = address(&response["to"]).unwrap();
+            let input_token = address(&request["inputToken"]).unwrap();
+            let output_token = address(&request["outputToken"]).unwrap();
+            let amount = request["amount"].as_str().unwrap();
+            let price_cap = response["resolvedPriceCap"].as_str().unwrap();
+            let config = takeOrders4Call::abi_decode(&data).unwrap().config;
+            let float = |raw: B256| Float::from_raw(raw).format().unwrap();
+
+            println!("\n=== calldata logged {} ===", exchange["timestamp_utc"]);
+            println!(
+                "minimumIO={} maximumIO={} maximumIORatio={} IOIsInput={} orders={}",
+                float(config.minimumIO),
+                float(config.maximumIO),
+                float(config.maximumIORatio),
+                config.IOIsInput,
+                config.orders.len()
+            );
+            for order in &config.orders {
+                println!(
+                    "order {} owner={} signedContexts={} outputVault={}",
+                    keccak256(order.order.abi_encode()),
+                    order.order.owner,
+                    order.signedContext.len(),
+                    order.order.validOutputs[order.outputIOIndex.to::<usize>()].vaultId,
+                );
+            }
+
+            let mode = ParsedTakeOrdersMode::parse(TakeOrdersMode::SpendUpTo, amount).unwrap();
+            let price_cap = Float::parse(price_cap.to_string()).unwrap();
+            let candidates: Vec<TakeOrderCandidate> = config
+                .orders
+                .iter()
+                .map(|order| TakeOrderCandidate {
+                    raindex,
+                    order: order.order.clone(),
+                    input_io_index: order.inputIOIndex.to::<u32>(),
+                    output_io_index: order.outputIOIndex.to::<u32>(),
+                    max_output: Float::parse("1000000".to_string()).unwrap(),
+                    ratio: price_cap,
+                    signed_context: order.signedContext.clone(),
+                })
+                .collect();
+            // The logged calldata as a selection. With one order the leg
+            // amounts do not affect the take that is rebuilt from it.
+            let first = SimulationResult {
+                legs: candidates
+                    .iter()
+                    .map(|candidate| SelectedTakeOrderLeg {
+                        candidate: candidate.clone(),
+                        input: mode.target_amount(),
+                        output: mode.target_amount(),
+                    })
+                    .collect(),
+                total_input: mode.target_amount(),
+                total_output: mode.target_amount(),
+            };
+            let rebuilt = build_take_orders_config_from_simulation(first.clone(), mode, price_cap)
+                .unwrap()
+                .unwrap()
+                .config;
+            println!(
+                "selection rebuilds the logged calldata exactly: {}",
+                rebuilt == config
+            );
+
+            // What the site sends: RiverTaker.take(config, in, out, maxIn, minOut).
+            let config_type = takeOrders4Call::SIGNATURE
+                .strip_prefix("takeOrders4(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap();
+            let selector = keccak256(format!(
+                "take({config_type},address,address,uint256,uint256)"
+            ));
+            let max_in = mode.target_amount().to_fixed_decimal_lossy(18).unwrap().0;
+            let mut outer = selector[..4].to_vec();
+            outer.extend(
+                (
+                    config.clone(),
+                    input_token,
+                    output_token,
+                    max_in,
+                    U256::from(1),
+                )
+                    .abi_encode_params(),
+            );
+
+            for rpc in &rpcs {
+                let host = rpc.host_str().unwrap_or("?").to_string();
+                let rpcs = std::slice::from_ref(rpc);
+                for block in &blocks {
+                    let header = ProviderBuilder::new()
+                        .connect_http(rpc.clone())
+                        .get_block(*block)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|block| (block.header.number, block.header.timestamp));
+                    println!("--- {host} block {block:?} (number, timestamp) = {header:?}");
+
+                    // What a quote sees: each order's calculate-io alone.
+                    for order in &config.orders {
+                        let quote = quote2Call {
+                            quoteConfig: QuoteV2 {
+                                order: order.order.clone(),
+                                inputIOIndex: order.inputIOIndex,
+                                outputIOIndex: order.outputIOIndex,
+                                signedContext: order.signedContext.clone(),
+                            },
+                        };
+                        let request = alloy::rpc::types::TransactionRequest::default()
+                            .from(executor)
+                            .to(raindex)
+                            .input(quote.abi_encode().into());
+                        let quoted = ProviderBuilder::new()
+                            .connect_http(rpc.clone())
+                            .call(request)
+                            .block(*block)
+                            .await
+                            .ok()
+                            .and_then(|output| quote2Call::abi_decode_returns(&output).ok())
+                            .map(|quote| {
+                                (quote.exists, float(quote.outputMax), float(quote.ioRatio))
+                            });
+                        println!(
+                            "quote2 {} (exists, outputMax, ioRatio) = {quoted:?}",
+                            keccak256(order.order.abi_encode())
+                        );
+                    }
+
+                    let inner = simulate_funded_call(FundedCall {
+                        rpcs,
+                        chain_id: 8453,
+                        block: *block,
+                        from: executor,
+                        to: raindex,
+                        token: input_token,
+                        calldata: data.clone(),
+                        verify_funding: true,
+                    })
+                    .await;
+                    println!("inner takeOrders4 from executor: {}", describe(&inner));
+
+                    let resolved = resolve_executable_take(
+                        &ReplayDataSource {
+                            rpcs: rpcs.to_vec(),
+                            block: *block,
+                        },
+                        ExecutableTakeRequest {
+                            chain_id: 8453,
+                            taker: executor,
+                            input_token,
+                            mode,
+                            price_cap,
+                        },
+                        candidates.clone(),
+                        first.clone(),
+                    )
+                    .await;
+                    println!(
+                        "search: {}",
+                        serde_json::to_string(&resolved.take_simulation).unwrap()
+                    );
+
+                    // The site's outer call for the route the search ends with.
+                    if resolved.take_simulation.status == TakeSimulationStatus::Executes {
+                        let surviving = build_take_orders_config_from_simulation(
+                            resolved.simulation.clone(),
+                            mode,
+                            price_cap,
+                        )
+                        .unwrap()
+                        .unwrap()
+                        .config;
+                        let mut surviving_outer = selector[..4].to_vec();
+                        surviving_outer.extend(
+                            (
+                                surviving.clone(),
+                                input_token,
+                                output_token,
+                                max_in,
+                                U256::from(1),
+                            )
+                                .abi_encode_params(),
+                        );
+                        let outcome = simulate_funded_call(FundedCall {
+                            rpcs,
+                            chain_id: 8453,
+                            block: *block,
+                            from: user,
+                            to: executor,
+                            token: input_token,
+                            calldata: surviving_outer.into(),
+                            verify_funding: true,
+                        })
+                        .await;
+                        println!(
+                            "outer RiverTaker.take from user, surviving {} order(s): {}",
+                            surviving.orders.len(),
+                            describe(&outcome)
+                        );
+                    }
+
+                    let wrapped = simulate_funded_call(FundedCall {
+                        rpcs,
+                        chain_id: 8453,
+                        block: *block,
+                        from: user,
+                        to: executor,
+                        token: input_token,
+                        calldata: outer.clone().into(),
+                        verify_funding: true,
+                    })
+                    .await;
+                    println!("outer RiverTaker.take from user: {}", describe(&wrapped));
+                }
+            }
+        }
     }
 }

@@ -12,6 +12,7 @@
 //! allowance to the orderbook for that one call. See `docs/take-simulation.md`.
 
 use crate::types::swap::TakeSimulationSkipReason;
+use alloy::eips::BlockId;
 use alloy::primitives::{b256, keccak256, Address, Bytes, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::state::{AccountOverride, StateOverride};
@@ -105,6 +106,7 @@ enum CallFailure {
 /// returned at once; anything else moves on to the next RPC.
 async fn eth_call(
     rpcs: &[Url],
+    block: BlockId,
     request: &TransactionRequest,
     overrides: &StateOverride,
 ) -> Result<Bytes, CallFailure> {
@@ -112,6 +114,7 @@ async fn eth_call(
         let provider = ProviderBuilder::new().connect_http(rpc.clone());
         match provider
             .call(request.clone())
+            .block(block)
             .overrides(overrides.clone())
             .await
         {
@@ -192,6 +195,7 @@ fn decode_word(output: &[u8]) -> Option<U256> {
 /// `Ok(None)`: the token answered, but with none of the probe values.
 async fn probe_layout(
     rpcs: &[Url],
+    block: BlockId,
     token: Address,
     view_calldata: Vec<u8>,
     slot_of: impl Fn(MappingLayout) -> B256,
@@ -207,7 +211,7 @@ async fn probe_layout(
     let request = TransactionRequest::default()
         .to(token)
         .input(view_calldata.into());
-    match eth_call(rpcs, &request, &overrides).await {
+    match eth_call(rpcs, block, &request, &overrides).await {
         Ok(output) => {
             Ok(decode_word(&output).and_then(|value| probed_candidate(&candidates, value)))
         }
@@ -219,6 +223,7 @@ async fn probe_layout(
 
 async fn token_layout(
     rpcs: &[Url],
+    block: BlockId,
     chain_id: u32,
     token: Address,
     taker: Address,
@@ -236,12 +241,14 @@ async fn token_layout(
     let (balance, allowance) = futures::join!(
         probe_layout(
             rpcs,
+            block,
             token,
             balanceOfCall { account: taker }.abi_encode(),
             |layout| layout.balance_slot(taker),
         ),
         probe_layout(
             rpcs,
+            block,
             token,
             allowanceCall {
                 owner: taker,
@@ -273,6 +280,7 @@ async fn token_layout(
 /// take, the revert may be the token transfer rather than the orders.
 async fn funding_reads_back(
     rpcs: &[Url],
+    block: BlockId,
     token: Address,
     taker: Address,
     spender: Address,
@@ -290,8 +298,8 @@ async fn funding_reads_back(
         .into(),
     );
     let (balance, allowance) = futures::join!(
-        eth_call(rpcs, &balance_request, overrides),
-        eth_call(rpcs, &allowance_request, overrides),
+        eth_call(rpcs, block, &balance_request, overrides),
+        eth_call(rpcs, block, &allowance_request, overrides),
     );
     let funded = |result: Result<Bytes, CallFailure>| match result {
         Ok(output) => Ok(decode_word(&output) == Some(SIMULATED_FUNDS)),
@@ -335,36 +343,66 @@ pub(crate) struct TakeSimulationRequest<'a> {
 /// funded for the call. Never fails: every way of not getting an answer is
 /// `NotSimulated`.
 pub(crate) async fn simulate_take(request: TakeSimulationRequest<'_>) -> TakeOutcome {
-    let TakeSimulationRequest {
+    simulate_funded_call(FundedCall {
+        rpcs: request.rpcs,
+        chain_id: request.chain_id,
+        block: BlockId::latest(),
+        from: request.taker,
+        to: request.raindex,
+        token: request.input_token,
+        calldata: takeOrders4Call {
+            config: request.config.clone(),
+        }
+        .abi_encode()
+        .into(),
+        verify_funding: request.verify_funding,
+    })
+    .await
+}
+
+/// A call simulated with `from` holding `token` and having approved `to` for
+/// it, for that call only.
+pub(crate) struct FundedCall<'a> {
+    pub rpcs: &'a [Url],
+    pub chain_id: u32,
+    pub block: BlockId,
+    pub from: Address,
+    /// Call target and spender of `token`.
+    pub to: Address,
+    pub token: Address,
+    pub calldata: Bytes,
+    pub verify_funding: bool,
+}
+
+pub(crate) async fn simulate_funded_call(call: FundedCall<'_>) -> TakeOutcome {
+    let FundedCall {
         rpcs,
         chain_id,
-        taker,
-        raindex,
-        input_token,
-        config,
+        block,
+        from,
+        to,
+        token,
+        calldata,
         verify_funding,
-    } = request;
+    } = call;
     if rpcs.is_empty() {
         return TakeOutcome::NotSimulated(TakeSimulationSkipReason::RpcUnavailable);
     }
 
-    let layout = match token_layout(rpcs, chain_id, input_token, taker, raindex).await {
+    let layout = match token_layout(rpcs, block, chain_id, token, from, to).await {
         Ok(Some(layout)) => layout,
         Ok(None) => {
             return TakeOutcome::NotSimulated(TakeSimulationSkipReason::OverrideUnavailable)
         }
         Err(()) => return TakeOutcome::NotSimulated(TakeSimulationSkipReason::RpcUnavailable),
     };
-    let overrides = funding_overrides(layout, input_token, taker, raindex);
-    let take = TransactionRequest::default().from(taker).to(raindex).input(
-        takeOrders4Call {
-            config: config.clone(),
-        }
-        .abi_encode()
-        .into(),
-    );
+    let overrides = funding_overrides(layout, token, from, to);
+    let request = TransactionRequest::default()
+        .from(from)
+        .to(to)
+        .input(calldata.into());
 
-    let data = match eth_call(rpcs, &take, &overrides).await {
+    let data = match eth_call(rpcs, block, &request, &overrides).await {
         Ok(_) => return TakeOutcome::Executes,
         Err(CallFailure::Unavailable) => {
             return TakeOutcome::NotSimulated(TakeSimulationSkipReason::RpcUnavailable)
@@ -374,16 +412,16 @@ pub(crate) async fn simulate_take(request: TakeSimulationRequest<'_>) -> TakeOut
     if !verify_funding {
         return TakeOutcome::Reverts(data);
     }
-    match funding_reads_back(rpcs, input_token, taker, raindex, &overrides).await {
+    match funding_reads_back(rpcs, block, token, from, to, &overrides).await {
         Ok(true) => TakeOutcome::Reverts(data),
         Ok(false) => {
             token_layouts()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .remove(&(chain_id, input_token));
+                .remove(&(chain_id, token));
             tracing::warn!(
                 chain_id,
-                %input_token,
+                %token,
                 "take simulation funding did not read back; dropped cached token layout"
             );
             TakeOutcome::NotSimulated(TakeSimulationSkipReason::OverrideUnavailable)

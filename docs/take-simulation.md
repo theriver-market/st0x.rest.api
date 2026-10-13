@@ -227,6 +227,30 @@ directly. It costs a state-loading and invalidation layer, and its answers are
 only as good as that layer's fidelity to the chain. This branch asks the chain
 itself, which is exact but pays RPC calls per quote.
 
+## The 13 Oct 2026 incident, replayed
+
+The logged `/v3/swap/calldata` responses were replayed read-only at the blocks
+of the two failures (52562140, 52562145 and 52562166; `mainnet.base.org` and
+`base.drpc.org` both served that state) with the ignored test
+`replay_logged_calldata` in `src/routes/swap/executable.rs`.
+
+- The calldata took two orders: `0x725d6c5e…299f`, an auction-dca order owned
+  by the selling wallet itself, then the market maker's `0xf6f1d7c5…3ce7`.
+- The inner `takeOrders4` from RiverTaker and the site's outer
+  `RiverTaker.take` from the wallet both revert with the same bytes:
+  `Error("Min trade amount.")`.
+- The search excludes `0x725d6c5e…299f` (it reverts alone), the other order
+  executes alone, and `RiverTaker.take` with only that order executes.
+
+The excluded order releases a budget of 3.230446 USDC linearly over 24 hours
+and offers what has accrued as its maximum output; its handle-io refuses any
+fill under 0.9 USDC. It was added at 15:17:47 UTC, so at 17:47 it offered
+0.335 USDC: a quote it could not honour at any size. It offered the better
+price then (0.0108897 wtSPYM per USDC against 0.0108964), so selection put it
+first. Later the market maker's oracle price moved to the better side and the
+order stopped being selected, which is why the same trade executed at 19:30.
+Nothing here is specific to that order: the search found it by running it.
+
 ## Cost
 
 Per quote with a taker: 1 extra `eth_call` when the take executes and the
