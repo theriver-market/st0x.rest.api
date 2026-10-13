@@ -23,6 +23,7 @@ mod registry_artifact;
 mod river_takes;
 mod routes;
 mod swap_capacity;
+mod take_simulation;
 mod telemetry;
 mod types;
 mod wrap_ratio;

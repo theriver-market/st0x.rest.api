@@ -162,6 +162,14 @@ pub(crate) fn swap_quoted_v2_event(
     );
     props.insert("fully_filled".to_string(), resp.fully_filled.into());
     props.insert(
+        "take_simulation_status".to_string(),
+        serde_json::to_value(resp.take_simulation.status).unwrap_or(Value::Null),
+    );
+    props.insert(
+        "excluded_order_count".to_string(),
+        resp.take_simulation.excluded_orders.len().into(),
+    );
+    props.insert(
         "resolved_price_cap".to_string(),
         resp.resolved_price_cap.clone().into(),
     );

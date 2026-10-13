@@ -91,7 +91,11 @@ impl MockSwapServices {
                         }
                         "/sg" => {
                             let orders = orders.read().await;
-                            let values = orders.iter().cloned().collect::<Vec<_>>();
+                            // One order, or a JSON array of orders.
+                            let values = match &*orders {
+                                Some(Value::Array(orders)) => orders.clone(),
+                                order => order.iter().cloned().collect::<Vec<_>>(),
+                            };
                             ("200 OK", json!({"data": {"orders": values}}).to_string())
                         }
                         _ => ("404 Not Found", json!({"error": "not found"}).to_string()),
@@ -595,4 +599,339 @@ async fn test_v1_and_v2_calldata_preserve_oracle_and_embed_api_key_attribution()
             ..
         }
     ));
+}
+
+/// An order that fills at `price` but whose handle-io rejects fills that take
+/// less than `min_output` from its vault. A quote cannot see that rule.
+fn min_trade_order_dotrain(
+    rpc_url: &str,
+    rainlang: Address,
+    raindex_subparser: Address,
+    input_token: Address,
+    output_token: Address,
+    price: u32,
+    min_output: u32,
+) -> String {
+    format!(
+        r#"
+version: 6
+networks:
+    test-network:
+        rpcs:
+            - {rpc_url}
+        chain-id: 8453
+        network-id: 8453
+        currency: ETH
+rainlangs:
+    test-rainlang:
+        network: test-network
+        address: {rainlang}
+tokens:
+    input:
+        network: test-network
+        address: {input_token}
+        decimals: 18
+        label: Input
+        symbol: INPUT
+    output:
+        network: test-network
+        address: {output_token}
+        decimals: 18
+        label: Output
+        symbol: OUTPUT
+raindex:
+    test-raindex:
+        address: 0x0000000000000000000000000000000000000001
+orders:
+    test-order:
+        inputs:
+            - token: input
+        outputs:
+            - token: output
+              vault-id: 1
+scenarios:
+    test-scenario:
+        rainlang: test-rainlang
+        bindings:
+            raindex-subparser: {raindex_subparser}
+deployments:
+    test-deployment:
+        scenario: test-scenario
+        order: test-order
+---
+#raindex-subparser !The raindex subparser
+#calculate-io
+using-words-from raindex-subparser
+amount price: 100 {price};
+#handle-add-order
+:;
+#handle-io
+:ensure(greater-than-or-equal-to(output-vault-decrease() {min_output}) "Min trade amount");
+"#
+    )
+}
+
+async fn add_min_trade_order(
+    local_evm: &LocalEvm,
+    owner: Address,
+    input_token: Address,
+    output_token: Address,
+    price: u32,
+    min_output: u32,
+) -> (Value, B256) {
+    let dotrain = min_trade_order_dotrain(
+        &local_evm.url(),
+        local_evm.rainlang,
+        *local_evm.raindex_subparser.address(),
+        input_token,
+        output_token,
+        price,
+        min_output,
+    );
+    let deployment = DotrainOrder::create(dotrain.clone(), None)
+        .await
+        .unwrap()
+        .dotrain_yaml()
+        .get_deployment("test-deployment")
+        .unwrap();
+    let add_order_call = AddOrderArgs::new_from_deployment(dotrain, deployment, None)
+        .await
+        .unwrap()
+        .try_into_call(vec![local_evm.url()])
+        .await
+        .unwrap();
+    let meta = add_order_call.config.meta.clone();
+    let (event, _) = local_evm
+        .add_order(&add_order_call.abi_encode(), owner)
+        .await;
+    let order = OrderV4::abi_decode(&event.order.abi_encode()).unwrap();
+    local_evm
+        .deposit(
+            owner,
+            output_token,
+            U256::from(10).pow(U256::from(20)),
+            18,
+            order.validOutputs[0].vaultId,
+        )
+        .await;
+    let raindex = *local_evm.raindex.address();
+    (
+        subgraph_order_json(&order, event.orderHash, &meta, raindex),
+        event.orderHash,
+    )
+}
+
+/// The 13 Oct 2026 incident in miniature: the quote fills an order whose
+/// handle-io then rejects the trade. The taker holds no input token and has
+/// approved nothing, as at quote time on the site.
+#[rocket::async_test]
+async fn test_quote_take_simulation_excludes_order_whose_handle_io_rejects_the_trade() {
+    use crate::routes::swap::quote::process_swap_quote_v2;
+    use crate::types::swap::{SwapQuoteV2Request, TakeSimulationSkipReason, TakeSimulationStatus};
+
+    let mut local_evm = LocalEvm::new().await;
+    let services = MockSwapServices::start_sequence(vec![json!([])]).await;
+    let owner = local_evm.signer_wallets[0].default_signer().address();
+    let taker = Address::repeat_byte(0x7a);
+    let input = local_evm
+        .deploy_new_token("Input", "INPUT", 18, U256::MAX, owner)
+        .await;
+    let output = local_evm
+        .deploy_new_token("Output", "OUTPUT", 18, U256::MAX, owner)
+        .await;
+    let input_address = *input.address();
+    let output_address = *output.address();
+    let raindex = *local_evm.raindex.address();
+    assert_eq!(input.balanceOf(taker).call().await.unwrap(), U256::ZERO);
+    assert_eq!(
+        input.allowance(taker, raindex).call().await.unwrap(),
+        U256::ZERO
+    );
+
+    // Cheapest order: 2 input per output, but at least 50 output per trade.
+    let (min_trade_order, min_trade_order_hash) =
+        add_min_trade_order(&local_evm, owner, input_address, output_address, 2, 50).await;
+    // Dearer order with no effective minimum.
+    let (plain_order, _) =
+        add_min_trade_order(&local_evm, owner, input_address, output_address, 3, 0).await;
+
+    let client = RaindexClient::new(
+        vec![client_yaml(
+            &local_evm.url(),
+            &services.subgraph_url(),
+            raindex,
+            input_address,
+            output_address,
+        )],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let database_url = format!(
+        "sqlite:file:{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    );
+    let pool = crate::db::init(&database_url, 1).await.unwrap();
+    let caches = RouteResponseCaches::new(0, Duration::ZERO);
+    let data_source = RaindexSwapDataSource::new(&client, &caches, &pool);
+    let quote = |taker: Option<Address>, amount: &str| SwapQuoteV2Request {
+        chain_id: Some(8453),
+        taker,
+        input_token: input_address,
+        output_token: output_address,
+        mode: SwapCalldataMode::BuyUpTo,
+        amount: amount.to_string(),
+        price_cap: Some("5".to_string()),
+        slippage_bps: None,
+        reference_io_ratio: None,
+        denomination: crate::types::swap::SwapDenomination::Wrapped,
+    };
+
+    // Only the minimum-trade order is on the book.
+    *services.subgraph_order.write().await = Some(min_trade_order.clone());
+
+    // Without a taker the quote is the plain one: it fills, nothing simulated.
+    let plain = process_swap_quote_v2(&data_source, quote(None, "10"))
+        .await
+        .unwrap();
+    assert!(plain.fully_filled);
+    assert_eq!(plain.estimated_input, "20");
+    assert_eq!(
+        plain.take_simulation.status,
+        TakeSimulationStatus::NotSimulated
+    );
+    assert_eq!(
+        plain.take_simulation.reason,
+        Some(TakeSimulationSkipReason::NoTaker)
+    );
+
+    // With a taker the take is simulated: the same quote does not execute.
+    let small = process_swap_quote_v2(&data_source, quote(Some(taker), "10"))
+        .await
+        .unwrap();
+    assert_eq!(small.take_simulation.status, TakeSimulationStatus::Reverts);
+    assert!(!small.fully_filled);
+    assert_eq!(small.estimated_input, "20");
+    assert_eq!(small.take_simulation.excluded_orders.len(), 1);
+    let excluded = &small.take_simulation.excluded_orders[0];
+    assert_eq!(excluded.order_hash, min_trade_order_hash);
+    assert_eq!(excluded.revert_reason.as_deref(), Some("Min trade amount"));
+    assert_eq!(
+        excluded.revert_data.as_ref(),
+        alloy::sol_types::SolError::abi_encode(&alloy::sol_types::Revert::from("Min trade amount"))
+    );
+
+    // A trade above the order's minimum executes for the same unfunded taker.
+    let large = process_swap_quote_v2(&data_source, quote(Some(taker), "60"))
+        .await
+        .unwrap();
+    assert_eq!(large.take_simulation.status, TakeSimulationStatus::Executes);
+    assert!(large.take_simulation.excluded_orders.is_empty());
+    assert!(large.fully_filled);
+    assert_eq!(large.estimated_input, "120");
+
+    // With a second order on the book, the reverting order is left out and
+    // the route is re-priced on what remains.
+    *services.subgraph_order.write().await =
+        Some(json!([min_trade_order.clone(), plain_order.clone()]));
+    let rerouted = process_swap_quote_v2(&data_source, quote(Some(taker), "10"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rerouted.take_simulation.status,
+        TakeSimulationStatus::Executes
+    );
+    assert_eq!(rerouted.take_simulation.excluded_orders.len(), 1);
+    assert_eq!(
+        rerouted.take_simulation.excluded_orders[0].order_hash,
+        min_trade_order_hash
+    );
+    assert!(rerouted.fully_filled);
+    assert_eq!(rerouted.estimated_output, "10");
+    assert_eq!(rerouted.estimated_input, "30");
+
+    // Calldata for the executor contract is built by the SDK without any
+    // preflight; it must leave the reverting order out as the quote did.
+    let executor = crate::river_takes::RIVER_TAKER_BASE;
+    let calldata = |amount: &str| SwapCalldataV2Request {
+        chain_id: Some(8453),
+        taker: executor,
+        input_token: input_address,
+        output_token: output_address,
+        mode: SwapCalldataMode::BuyUpTo,
+        amount: amount.to_string(),
+        price_cap: Some("5".to_string()),
+        slippage_bps: None,
+        reference_io_ratio: None,
+        denomination: crate::types::swap::SwapDenomination::Wrapped,
+    };
+    let rerouted_calldata = process_swap_calldata_v2(&data_source, calldata("10"))
+        .await
+        .unwrap()
+        .calldata;
+    assert_eq!(rerouted_calldata.to, raindex);
+    assert!(rerouted_calldata.approvals.is_empty());
+    assert_eq!(rerouted_calldata.estimated_input, "30");
+    let rerouted_take = takeOrders4Call::abi_decode(&rerouted_calldata.data).unwrap();
+    assert_eq!(rerouted_take.config.orders.len(), 1);
+    assert_ne!(
+        keccak256(rerouted_take.config.orders[0].order.abi_encode()),
+        min_trade_order_hash
+    );
+    // Above the minimum nothing is excluded and the SDK's calldata is used.
+    let whole_calldata = process_swap_calldata_v2(&data_source, calldata("60"))
+        .await
+        .unwrap()
+        .calldata;
+    let whole_take = takeOrders4Call::abi_decode(&whole_calldata.data).unwrap();
+    assert_eq!(
+        keccak256(whole_take.config.orders[0].order.abi_encode()),
+        min_trade_order_hash
+    );
+    // With only the reverting order on the book there is nothing to build.
+    *services.subgraph_order.write().await = Some(min_trade_order.clone());
+    assert!(matches!(
+        process_swap_calldata_v2(&data_source, calldata("10")).await,
+        Err(ApiError::Coded {
+            code: ApiErrorCode::SwapNoLiquidity,
+            ..
+        })
+    ));
+
+    // A three-leg take whose last, partial leg falls under that order's
+    // minimum: the legs are simulated one by one, only the failing one is
+    // left out, and the other two still fill what they can.
+    let (dear_min_trade_order, dear_min_trade_order_hash) =
+        add_min_trade_order(&local_evm, owner, input_address, output_address, 4, 50).await;
+    *services.subgraph_order.write().await =
+        Some(json!([min_trade_order, plain_order, dear_min_trade_order]));
+    let partial = process_swap_quote_v2(&data_source, quote(Some(taker), "210"))
+        .await
+        .unwrap();
+    assert_eq!(
+        partial.take_simulation.status,
+        TakeSimulationStatus::Executes
+    );
+    assert_eq!(partial.take_simulation.excluded_orders.len(), 1);
+    assert_eq!(
+        partial.take_simulation.excluded_orders[0].order_hash,
+        dear_min_trade_order_hash
+    );
+    assert_eq!(
+        partial.take_simulation.excluded_orders[0]
+            .revert_reason
+            .as_deref(),
+        Some("Min trade amount")
+    );
+    assert!(!partial.fully_filled);
+    assert_eq!(partial.estimated_output, "200");
+    assert_eq!(partial.estimated_input, "500");
+
+    // Nothing above changed the taker's real balance or allowance.
+    assert_eq!(input.balanceOf(taker).call().await.unwrap(), U256::ZERO);
+    assert_eq!(
+        input.allowance(taker, raindex).call().await.unwrap(),
+        U256::ZERO
+    );
 }

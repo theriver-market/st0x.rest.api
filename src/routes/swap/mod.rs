@@ -1,6 +1,7 @@
 mod calldata;
 mod denomination;
 mod exchange_log;
+mod executable;
 mod quote;
 mod slippage;
 
@@ -10,13 +11,17 @@ use crate::cache::RouteResponseCaches;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorCode};
 use crate::routes::raindex_backed_tokens;
-use crate::types::swap::{SwapCalldataMode, SwapCalldataResponse, SwapDenomination};
+use crate::take_simulation::{simulate_take, TakeOutcome, TakeSimulationRequest};
+use crate::types::swap::{
+    SwapCalldataMode, SwapCalldataResponse, SwapDenomination, TakeSimulationSkipReason,
+};
 use crate::wrap_ratio::{
     persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
     wrap_ratio_values_from_responses, WrapRatioValue,
 };
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use rain_orderbook_bindings::IRaindexV6::TakeOrdersConfigV5;
 use rain_orderbook_common::raindex_client::order_quotes::{
     get_order_quotes_batch_with_injector, RaindexOrderQuote,
 };
@@ -36,9 +41,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
 
-/// RiverTaker on Base (theriver-market/river-contracts 740bd8a, verified on
-/// Blockscout): immutable orderbook/USDC/fee receiver/10 bps, no owner.
-const RIVER_TAKER_BASE: &str = "0xd0daDF272d6c07129c058B937B867428A46c4fDb";
+/// Whether `taker` is our pinned executor contract: RiverTaker on Base
+/// (theriver-market/river-contracts 740bd8a, verified on Blockscout):
+/// immutable orderbook/USDC/fee receiver/10 bps, no owner. It calls
+/// `takeOrders4` itself, so calldata for it is built without taker checks.
+pub(crate) fn is_executor_taker(chain_id: u32, taker: Address) -> bool {
+    chain_id == crate::river_takes::RIVER_TAKER_CHAIN_ID
+        && taker == crate::river_takes::RIVER_TAKER_BASE
+}
 
 struct SwapAnalyticsContext {
     chain_id: Option<u32>,
@@ -346,6 +356,21 @@ pub(crate) trait SwapDataSource: Send + Sync {
         Ok(response)
     }
 
+    /// Simulates `takeOrders4(config)` on `raindex` from `taker`, with the
+    /// taker given the input token and allowance for the call only. Sources
+    /// that cannot simulate say so; they never guess.
+    async fn simulate_take(
+        &self,
+        _chain_id: u32,
+        _taker: Address,
+        _input_token: Address,
+        _raindex: Address,
+        _config: &TakeOrdersConfigV5,
+        _verify_funding: bool,
+    ) -> TakeOutcome {
+        TakeOutcome::NotSimulated(TakeSimulationSkipReason::RpcUnavailable)
+    }
+
     async fn get_wrap_ratios_for_tokens(
         &self,
         _token_addresses: &[Address],
@@ -611,7 +636,10 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         // build the calldata without the taker approval check / preflight
         // (the contract approves just in time and holds no balance). The site
         // simulates the real RiverTaker.take call before the wallet opens.
-        let unchecked = request.taker.eq_ignore_ascii_case(RIVER_TAKER_BASE) && chain_id == 8453;
+        let unchecked = request
+            .taker
+            .parse::<Address>()
+            .is_ok_and(|taker| is_executor_taker(chain_id, taker));
         let result = if unchecked {
             self.client
                 .get_take_orders_calldata_unchecked(request)
@@ -647,6 +675,34 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 "swap calldata could not be generated",
             ))
         }
+    }
+
+    async fn simulate_take(
+        &self,
+        chain_id: u32,
+        taker: Address,
+        input_token: Address,
+        raindex: Address,
+        config: &TakeOrdersConfigV5,
+        verify_funding: bool,
+    ) -> TakeOutcome {
+        let rpcs = match self.client.get_network_by_chain_id(chain_id) {
+            Ok(network) => network.rpcs,
+            Err(error) => {
+                tracing::error!(%error, chain_id, "failed to read RPCs for take simulation");
+                return TakeOutcome::NotSimulated(TakeSimulationSkipReason::RpcUnavailable);
+            }
+        };
+        simulate_take(TakeSimulationRequest {
+            rpcs: &rpcs,
+            chain_id,
+            taker,
+            raindex,
+            input_token,
+            config,
+            verify_funding,
+        })
+        .await
     }
 
     async fn get_wrap_ratios_for_tokens(

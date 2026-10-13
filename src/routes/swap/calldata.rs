@@ -1,5 +1,7 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, exchange_log::SwapExchangeLog,
+    capture_swap_outcome, ensure_distinct_tokens,
+    exchange_log::SwapExchangeLog,
+    executable::{resolve_executable_take, ExecutableTakeRequest},
     no_liquidity_error, request_chain_id, snapshot_swap_context, RaindexSwapDataSource,
     SwapAnalyticsContext, SwapCandidateBuild, SwapDataSource,
 };
@@ -20,7 +22,7 @@ use crate::routes::swap::denomination::{
 use crate::swap_capacity::SwapCapacity;
 use crate::types::swap::{
     SwapCalldataRequest, SwapCalldataResponse, SwapCalldataV2Request, SwapCalldataV2RequestBody,
-    SwapCalldataV2Response,
+    SwapCalldataV2Response, TakeSimulationStatus,
 };
 use alloy::primitives::{keccak256, Address, Bytes, Signature, B256};
 use alloy::sol_types::{SolCall, SolValue};
@@ -29,7 +31,10 @@ use rain_math_float::Float;
 use rain_orderbook_bindings::IRaindexV6::{takeOrders4Call, OrderV4};
 use rain_orderbook_common::oracle::{encode_oracle_body_batch, fetch_signed_context_batch};
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
-use rain_orderbook_common::take_orders::TakeOrdersMode;
+use rain_orderbook_common::take_orders::{
+    build_take_orders_config_from_simulation, ParsedTakeOrdersMode, TakeOrderCandidate,
+    TakeOrdersMode,
+};
 use rocket::serde::json::Json;
 use rocket::State;
 use std::collections::BTreeMap;
@@ -609,7 +614,7 @@ async fn process_swap_calldata_build(
         .await
         .map_err(map_calldata_boundary_error)?;
 
-    let (amount, price_cap, resolved_price_cap, wrap_ratios) = match req.price_limit {
+    let (amount, price_cap, resolved_price_cap, wrap_ratios, candidates) = match req.price_limit {
         SwapCalldataPriceLimit::Explicit { value, field } => {
             let resolved_price_cap = value.clone();
             let (amount, price_cap, wrap_ratios) = normalize_calldata_request_values(
@@ -628,7 +633,7 @@ async fn process_swap_calldata_build(
             )
             .await
             .map_err(map_calldata_boundary_error)?;
-            build_calldata_candidates(
+            let candidate_build = build_calldata_candidates(
                 ds,
                 req.chain_id,
                 req.input_token,
@@ -636,7 +641,13 @@ async fn process_swap_calldata_build(
                 req.taker,
             )
             .await?;
-            (amount, price_cap, resolved_price_cap, wrap_ratios)
+            (
+                amount,
+                price_cap,
+                resolved_price_cap,
+                wrap_ratios,
+                candidate_build.candidates,
+            )
         }
         SwapCalldataPriceLimit::SlippageBps {
             slippage_bps,
@@ -686,7 +697,7 @@ async fn process_swap_calldata_build(
             )
             .await?;
             let price_cap = super::slippage::resolve_slippage_price_cap(
-                candidate_build.candidates,
+                candidate_build.candidates.clone(),
                 req.mode,
                 &amount,
                 slippage_bps,
@@ -714,7 +725,13 @@ async fn process_swap_calldata_build(
                     "swap calldata could not be generated",
                 )
             })?;
-            (amount, price_cap, resolved_price_cap, wrap_ratios)
+            (
+                amount,
+                price_cap,
+                resolved_price_cap,
+                wrap_ratios,
+                candidate_build.candidates,
+            )
         }
     };
 
@@ -728,10 +745,22 @@ async fn process_swap_calldata_build(
         price_cap,
     };
 
-    let response = ds
-        .get_calldata_on_chain(req.chain_id, take_req)
-        .await
-        .map_err(map_calldata_boundary_error)?;
+    let executor_response = executor_calldata_without_reverting_orders(
+        ds,
+        req.chain_id,
+        req.taker,
+        req.input_token,
+        &take_req,
+        candidates,
+    )
+    .await?;
+    let response = match executor_response {
+        Some(response) => response,
+        None => ds
+            .get_calldata_on_chain(req.chain_id, take_req)
+            .await
+            .map_err(map_calldata_boundary_error)?,
+    };
     let mut calldata =
         normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
             .map_err(map_calldata_boundary_error)?;
@@ -749,6 +778,108 @@ async fn process_swap_calldata_build(
         calldata,
         resolved_price_cap,
     })
+}
+
+/// Calldata for the executor contract, built here when the simulated take
+/// shows that some selected order reverts.
+///
+/// The SDK builds executor calldata without any preflight, so it would hand
+/// back the reverting order. `Ok(None)` leaves the request to the SDK: the
+/// taker is not the executor, nothing had to be excluded, or the simulation
+/// gave no answer. When no take executes at all there is nothing to build.
+async fn executor_calldata_without_reverting_orders(
+    ds: &dyn SwapDataSource,
+    chain_id: u32,
+    taker: Address,
+    input_token: Address,
+    take_req: &TakeOrdersRequest,
+    candidates: Vec<TakeOrderCandidate>,
+) -> Result<Option<SwapCalldataResponse>, ApiError> {
+    if !super::is_executor_taker(chain_id, taker) {
+        return Ok(None);
+    }
+    // Requests the SDK would reject are left for it to reject.
+    let (Ok(mode), Ok(price_cap)) = (
+        ParsedTakeOrdersMode::parse(take_req.mode, &take_req.amount),
+        Float::parse(take_req.price_cap.clone()),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(first) =
+        super::slippage::select_best_raindex_simulation(candidates.clone(), mode, price_cap)
+    else {
+        return Ok(None);
+    };
+    let resolved = resolve_executable_take(
+        ds,
+        ExecutableTakeRequest {
+            chain_id,
+            taker,
+            input_token,
+            mode,
+            price_cap,
+        },
+        candidates,
+        first,
+    )
+    .await;
+
+    match resolved.take_simulation.status {
+        TakeSimulationStatus::Reverts => {
+            tracing::warn!(
+                excluded_order_count = resolved.take_simulation.excluded_orders.len(),
+                revert_data = ?resolved.take_simulation.revert_data,
+                "no simulated take executes; not building executor calldata"
+            );
+            Err(no_liquidity_error())
+        }
+        TakeSimulationStatus::Executes if !resolved.take_simulation.excluded_orders.is_empty() => {
+            let failed = |error: &dyn std::fmt::Display| {
+                tracing::error!(%error, "failed to build executor calldata from simulated take");
+                ApiError::coded(
+                    ApiErrorCode::SwapCalldataFailed,
+                    "swap calldata could not be generated",
+                )
+            };
+            let estimated_input = resolved
+                .simulation
+                .total_input
+                .format()
+                .map_err(|error| failed(&error))?;
+            let raindex = resolved
+                .simulation
+                .legs
+                .first()
+                .map(|leg| leg.candidate.raindex);
+            let built =
+                build_take_orders_config_from_simulation(resolved.simulation, mode, price_cap)
+                    .map_err(|error| failed(&error))?;
+            let (Some(raindex), Some(built)) = (raindex, built) else {
+                return Err(failed(&"simulated take has no legs"));
+            };
+            tracing::info!(
+                %raindex,
+                order_count = built.config.orders.len(),
+                excluded_order_count = resolved.take_simulation.excluded_orders.len(),
+                "built executor calldata without orders whose simulated take reverts"
+            );
+            Ok(Some(SwapCalldataResponse {
+                chain_id,
+                to: raindex,
+                data: Bytes::from(
+                    takeOrders4Call {
+                        config: built.config,
+                    }
+                    .abi_encode(),
+                ),
+                value: alloy::primitives::U256::ZERO,
+                estimated_input,
+                denomination: crate::types::swap::SwapDenomination::Wrapped,
+                approvals: vec![],
+            }))
+        }
+        TakeSimulationStatus::Executes | TakeSimulationStatus::NotSimulated => Ok(None),
+    }
 }
 
 /// Replace oracle signed context in executable takeOrders calldata with a
