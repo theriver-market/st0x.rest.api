@@ -1,6 +1,7 @@
 mod calldata;
 mod denomination;
 mod exchange_log;
+mod executable;
 mod quote;
 mod slippage;
 
@@ -10,13 +11,17 @@ use crate::cache::RouteResponseCaches;
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiErrorCode};
 use crate::routes::raindex_backed_tokens;
-use crate::types::swap::{SwapCalldataMode, SwapCalldataResponse, SwapDenomination};
+use crate::take_simulation::{simulate_take, TakeOutcome, TakeSimulationRequest};
+use crate::types::swap::{
+    SwapCalldataMode, SwapCalldataResponse, SwapDenomination, TakeSimulationSkipReason,
+};
 use crate::wrap_ratio::{
     persist_wrap_ratio_snapshots_best_effort, read_wrap_ratio_responses_for_addresses,
     wrap_ratio_values_from_responses, WrapRatioValue,
 };
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use rain_orderbook_bindings::IRaindexV6::TakeOrdersConfigV5;
 use rain_orderbook_common::raindex_client::order_quotes::{
     get_order_quotes_batch_with_injector, RaindexOrderQuote,
 };
@@ -35,6 +40,15 @@ use rocket::Route;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
+
+/// Whether `taker` is our pinned executor contract: RiverTaker on Base
+/// (theriver-market/river-contracts 740bd8a, verified on Blockscout):
+/// immutable orderbook/USDC/fee receiver/10 bps, no owner. It calls
+/// `takeOrders4` itself, so calldata for it is built without taker checks.
+pub(crate) fn is_executor_taker(chain_id: u32, taker: Address) -> bool {
+    chain_id == crate::river_takes::RIVER_TAKER_CHAIN_ID
+        && taker == crate::river_takes::RIVER_TAKER_BASE
+}
 
 struct SwapAnalyticsContext {
     chain_id: Option<u32>,
@@ -342,6 +356,21 @@ pub(crate) trait SwapDataSource: Send + Sync {
         Ok(response)
     }
 
+    /// Simulates `takeOrders4(config)` on `raindex` from `taker`, with the
+    /// taker given the input token and allowance for the call only. Sources
+    /// that cannot simulate say so; they never guess.
+    async fn simulate_take(
+        &self,
+        _chain_id: u32,
+        _taker: Address,
+        _input_token: Address,
+        _raindex: Address,
+        _config: &TakeOrdersConfigV5,
+        _verify_funding: bool,
+    ) -> TakeOutcome {
+        TakeOutcome::NotSimulated(TakeSimulationSkipReason::RpcUnavailable)
+    }
+
     async fn get_wrap_ratios_for_tokens(
         &self,
         _token_addresses: &[Address],
@@ -602,11 +631,23 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         chain_id: u32,
         request: TakeOrdersRequest,
     ) -> Result<SwapCalldataResponse, ApiError> {
-        let result = self
-            .client
-            .get_take_orders_calldata(request)
-            .await
-            .map_err(map_raindex_error)?;
+        // The River: when the taker is our pinned RiverTaker contract (it pulls
+        // funds from the user and charges the interface fee in the same tx),
+        // build the calldata without the taker approval check / preflight
+        // (the contract approves just in time and holds no balance). The site
+        // simulates the real RiverTaker.take call before the wallet opens.
+        let unchecked = request
+            .taker
+            .parse::<Address>()
+            .is_ok_and(|taker| is_executor_taker(chain_id, taker));
+        let result = if unchecked {
+            self.client
+                .get_take_orders_calldata_unchecked(request)
+                .await
+        } else {
+            self.client.get_take_orders_calldata(request).await
+        }
+        .map_err(map_raindex_error)?;
 
         if let Some(approval_info) = result.approval_info() {
             let formatted_amount = approval_info.formatted_amount().to_string();
@@ -634,6 +675,34 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
                 "swap calldata could not be generated",
             ))
         }
+    }
+
+    async fn simulate_take(
+        &self,
+        chain_id: u32,
+        taker: Address,
+        input_token: Address,
+        raindex: Address,
+        config: &TakeOrdersConfigV5,
+        verify_funding: bool,
+    ) -> TakeOutcome {
+        let rpcs = match self.client.get_network_by_chain_id(chain_id) {
+            Ok(network) => network.rpcs,
+            Err(error) => {
+                tracing::error!(%error, chain_id, "failed to read RPCs for take simulation");
+                return TakeOutcome::NotSimulated(TakeSimulationSkipReason::RpcUnavailable);
+            }
+        };
+        simulate_take(TakeSimulationRequest {
+            rpcs: &rpcs,
+            chain_id,
+            taker,
+            raindex,
+            input_token,
+            config,
+            verify_funding,
+        })
+        .await
     }
 
     async fn get_wrap_ratios_for_tokens(
@@ -681,6 +750,47 @@ impl<'a> SwapDataSource for RaindexSwapDataSource<'a> {
         persist_wrap_ratio_snapshots_best_effort(self.pool, &responses).await;
         Ok(wrap_ratio_values_from_responses(responses))
     }
+}
+
+/// The `user` whose own orders are left out of selection, if any.
+///
+/// Only for the executor: there the API builds the calldata itself and the
+/// trade pays the interface fee. For any other taker the SDK selects the
+/// orders for the calldata and cannot be told to leave one out, so `user`
+/// deliberately changes nothing, in the quote as well, to keep the two in
+/// agreement. Nobody is refused a trade for having an order on the pair.
+pub(crate) fn user_for_selection(
+    chain_id: u32,
+    taker: Option<Address>,
+    user: Option<Address>,
+) -> Option<Address> {
+    user.filter(|_| taker.is_some_and(|taker| is_executor_taker(chain_id, taker)))
+}
+
+/// Removes candidates whose order is owned by `user`, the person the trade is
+/// for, and returns how many were removed. A hard exclusion, applied before
+/// any selection or simulation, so such an order cannot come back in a later
+/// round: trading with yourself moves nothing and still pays fees. `None`
+/// removes nothing.
+pub(crate) fn exclude_orders_owned_by(
+    candidates: &mut Vec<TakeOrderCandidate>,
+    user: Option<Address>,
+) -> usize {
+    let Some(user) = user else {
+        return 0;
+    };
+    let before = candidates.len();
+    candidates.retain(|candidate| candidate.order.owner != user);
+    let excluded = before - candidates.len();
+    if excluded > 0 {
+        tracing::info!(
+            %user,
+            own_order_count = excluded,
+            candidate_count = candidates.len(),
+            "left out swap candidates owned by the user"
+        );
+    }
+    excluded
 }
 
 fn swap_calldata_response_from_take_orders_info(

@@ -134,14 +134,54 @@ pub(crate) fn active_filter_for_state(state: Option<OrderState>) -> Option<bool>
     }
 }
 
+/// The order's Rainlang from its onchain meta, falling back to the dotrain source.
+pub(crate) fn order_source(order: &RaindexOrder) -> Option<String> {
+    order.rainlang().or_else(|| order.dotrain_source())
+}
+
 pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType {
-    let source = order.rainlang().or_else(|| order.dotrain_source());
+    let source = order_source(order);
     let Some(source) = source else {
         return OrderSummaryOrderType::Custom;
     };
 
     if source.contains("other-vwaio") {
         return OrderSummaryOrderType::DynamicSpread;
+    }
+
+    // The River's strategies, by fingerprints unique to each Rainlang. Checked
+    // before DCA: river-ladder uses linear-growth and was labelled DCA (2 Oct).
+    if source.contains("Stop not triggered") {
+        return OrderSummaryOrderType::Stop;
+    }
+    if source.contains("Stop-buy not triggered") {
+        return OrderSummaryOrderType::StopBuy;
+    }
+    if source.contains("Trade causes dust") {
+        return OrderSummaryOrderType::Ladder;
+    }
+    if is_cycle_source(&source) {
+        return OrderSummaryOrderType::Cycle;
+    }
+    // river-spread: `ask-per-share: max(mul(price ...)) min-sell` (its bid line
+    // is peg-like, so it is checked first).
+    if source.lines().any(|line| {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.starts_with("ask-per-share:max(mul(price")
+    }) {
+        return OrderSummaryOrderType::Spread;
+    }
+    if source.lines().any(|line| {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.starts_with("per-share:min(mul(price")
+    }) {
+        return OrderSummaryOrderType::Peg;
+    }
+    if source
+        .lines()
+        .any(|line| line.trim_start().starts_with("rebalance-usd:"))
+    {
+        return OrderSummaryOrderType::Basket;
     }
 
     let handle_io = handle_io_section(&source);
@@ -160,6 +200,22 @@ pub(crate) fn classify_order_type(order: &RaindexOrder) -> OrderSummaryOrderType
     }
 
     OrderSummaryOrderType::Custom
+}
+
+/// river-cycle: `max-output: if(equal-to(get(<32-byte key>) <phase>) ...`.
+fn is_cycle_source(source: &str) -> bool {
+    source.lines().any(|line| {
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        compact
+            .find("max-output:if(equal-to(get(0x")
+            .map(|i| {
+                let rest = &compact[i + "max-output:if(equal-to(get(0x".len()..];
+                rest.len() > 64
+                    && rest[..64].chars().all(|c| c.is_ascii_hexdigit())
+                    && rest[64..].starts_with(')')
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn handle_io_section(source: &str) -> Option<String> {
@@ -589,6 +645,7 @@ pub(crate) fn build_order_summary(
         io_ratio,
         created_at,
         orderbook_id: order.raindex(),
+        rainlang: None,
     })
 }
 
@@ -968,6 +1025,50 @@ mod tests {
             classify_order_type(&order),
             OrderSummaryOrderType::DynamicSpread
         );
+    }
+
+    #[test]
+    fn test_classify_order_type_river_strategies() {
+        let stop = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nprice _: dia-price(\"SGOV\" 10800),\n:ensure(less-than-or-equal-to(price 50) \"Stop not triggered\"),\nmax-output: max-positive-value(),\nio: mul(price 1 0.98);\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&stop), OrderSummaryOrderType::Stop);
+        let peg = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nprice _: dia-price(\"NVDA\" 10800),\nshares-per-token: call<2>(),\nper-share: min(mul(price 0.997) 300),\nmax-output: max-positive-value(),\nio: inv(mul(per-share shares-per-token));\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&peg), OrderSummaryOrderType::Peg);
+        let basket = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nrebalance-usd: if(greater-than(v-out mul(v-in add(1 0.02))) gap-usd 0),\nmax-output: 0,\nio: 1;\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&basket), OrderSummaryOrderType::Basket);
+        let stop_buy = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nprice _: dia-price(\"NVDA\" 10800),\n:ensure(greater-than-or-equal-to(price 250) \"Stop-buy not triggered\"),\n:ensure(less-than-or-equal-to(price 260) \"Above max price\"),\nmax-output: max-positive-value(),\nio: div(1 mul(price 1 1.02));\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(
+            classify_order_type(&stop_buy),
+            OrderSummaryOrderType::StopBuy
+        );
+        let spread = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nprice _: dia-price(0x01 10800),\nask-per-share: max(mul(price add(1 s)) 90),\nbid-per-share: min(mul(price sub(1 s)) 110),\nmax-output: max-positive-value(),\nio: 1;\n\n/* 1. handle-io */\n:;",
+        ));
+        assert_eq!(classify_order_type(&spread), OrderSummaryOrderType::Spread);
+        assert_eq!(
+            serde_json::to_string(&OrderSummaryOrderType::Spread).unwrap(),
+            "\"spread\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OrderSummaryOrderType::StopBuy).unwrap(),
+            "\"stop-buy\""
+        );
+        // Ladder uses linear-growth (a DCA marker) and must not be labelled DCA.
+        let ladder = mock_order_with_source(Some(
+            "/* 0. calculate-io */\ntranche-io-ratio: linear-growth(0.0111 0.0005 0),\n\n/* 1. handle-io */\n:ensure(any(is-zero(frac(x)) 1) \"Trade causes dust.\"),\n:;",
+        ));
+        assert_eq!(classify_order_type(&ladder), OrderSummaryOrderType::Ladder);
+        let cycle = mock_order_with_source(Some(
+            "/* 0. calculate-io */\nmax-output io: call<2>();\n\n/* 1. handle-io */\n:call<3>();\n\n/* 2. sell-calculate-io */\nmax-output: if(equal-to(get(0x091156eed579139da9eba7cace36f041b0d573886e8c646976e79e27e3b91b25) 1) 0.03333333 0),\nio: 91.8;",
+        ));
+        assert_eq!(classify_order_type(&cycle), OrderSummaryOrderType::Cycle);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, exchange_log::SwapExchangeLog,
+    capture_swap_outcome, ensure_distinct_tokens,
+    exchange_log::SwapExchangeLog,
+    executable::{resolve_executable_take, ExecutableTakeRequest},
     no_liquidity_error, request_chain_id, snapshot_swap_context, RaindexSwapDataSource,
     SwapAnalyticsContext, SwapCandidateBuild, SwapDataSource,
 };
@@ -20,7 +22,7 @@ use crate::routes::swap::denomination::{
 use crate::swap_capacity::SwapCapacity;
 use crate::types::swap::{
     SwapCalldataRequest, SwapCalldataResponse, SwapCalldataV2Request, SwapCalldataV2RequestBody,
-    SwapCalldataV2Response,
+    SwapCalldataV2Response, TakeSimulationStatus,
 };
 use alloy::primitives::{keccak256, Address, Bytes, Signature, B256};
 use alloy::sol_types::{SolCall, SolValue};
@@ -29,7 +31,10 @@ use rain_math_float::Float;
 use rain_orderbook_bindings::IRaindexV6::{takeOrders4Call, OrderV4};
 use rain_orderbook_common::oracle::{encode_oracle_body_batch, fetch_signed_context_batch};
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
-use rain_orderbook_common::take_orders::TakeOrdersMode;
+use rain_orderbook_common::take_orders::{
+    build_take_orders_config_from_simulation, ParsedTakeOrdersMode, TakeOrderCandidate,
+    TakeOrdersMode,
+};
 use rocket::serde::json::Json;
 use rocket::State;
 use std::collections::BTreeMap;
@@ -450,6 +455,8 @@ fn validate_attribution_calldata(
 struct SwapCalldataBuildRequest {
     chain_id: u32,
     taker: Address,
+    /// The person the trade is for, when the request names one.
+    user: Option<Address>,
     input_token: Address,
     output_token: Address,
     mode: TakeOrdersMode,
@@ -483,6 +490,7 @@ impl TryFrom<SwapCalldataRequest> for SwapCalldataBuildRequest {
         Ok(Self {
             chain_id: request_chain_id(req.chain_id)?,
             taker: req.taker,
+            user: None,
             input_token: req.input_token,
             output_token: req.output_token,
             mode: TakeOrdersMode::BuyUpTo,
@@ -537,6 +545,7 @@ impl TryFrom<SwapCalldataV2Request> for SwapCalldataBuildRequest {
         Ok(Self {
             chain_id: request_chain_id(req.chain_id)?,
             taker: req.taker,
+            user: req.user,
             input_token: req.input_token,
             output_token: req.output_token,
             mode: req.mode.into(),
@@ -557,7 +566,7 @@ async fn process_swap_calldata(
         .calldata)
 }
 
-async fn process_swap_calldata_v2(
+pub(super) async fn process_swap_calldata_v2(
     ds: &dyn SwapDataSource,
     req: SwapCalldataV2Request,
 ) -> Result<SwapCalldataV2Response, ApiError> {
@@ -569,13 +578,16 @@ async fn process_swap_calldata_v2(
     })
 }
 
+/// Candidates for the pair and how many were left out for being owned by
+/// `user`, which only happens when `taker` is the executor.
 async fn build_calldata_candidates(
     ds: &dyn SwapDataSource,
     chain_id: u32,
     input_token: Address,
     output_token: Address,
     taker: Address,
-) -> Result<SwapCandidateBuild, ApiError> {
+    user: Option<Address>,
+) -> Result<(Vec<TakeOrderCandidate>, usize), ApiError> {
     let orders = ds
         .get_orders_for_pair_on_chain(chain_id, input_token, output_token)
         .await
@@ -584,17 +596,25 @@ async fn build_calldata_candidates(
         return Err(no_liquidity_error());
     }
 
-    let candidate_build = ds
+    let SwapCandidateBuild {
+        mut candidates,
+        failures,
+    } = ds
         .build_candidates_for_pair(&orders, input_token, output_token, taker)
         .await
         .map_err(map_calldata_boundary_error)?;
-    if let Some(error) = candidate_build.failures.oracle_unavailable_error() {
-        return Err(error);
+    let own_order_count = super::exclude_orders_owned_by(
+        &mut candidates,
+        super::user_for_selection(chain_id, Some(taker), user),
+    );
+    // Executable candidates win in a mixed book: an order whose oracle can't be
+    // fetched can't be taken, so it can't make the user's price worse.
+    if candidates.is_empty() {
+        return Err(failures
+            .oracle_unavailable_error()
+            .unwrap_or_else(no_liquidity_error));
     }
-    if candidate_build.candidates.is_empty() {
-        return Err(no_liquidity_error());
-    }
-    Ok(candidate_build)
+    Ok((candidates, own_order_count))
 }
 
 async fn process_swap_calldata_build(
@@ -607,7 +627,7 @@ async fn process_swap_calldata_build(
         .await
         .map_err(map_calldata_boundary_error)?;
 
-    let (amount, price_cap, resolved_price_cap, wrap_ratios) = match req.price_limit {
+    let (amount, price_cap, resolved_price_cap, wrap_ratios, candidates) = match req.price_limit {
         SwapCalldataPriceLimit::Explicit { value, field } => {
             let resolved_price_cap = value.clone();
             let (amount, price_cap, wrap_ratios) = normalize_calldata_request_values(
@@ -626,15 +646,22 @@ async fn process_swap_calldata_build(
             )
             .await
             .map_err(map_calldata_boundary_error)?;
-            build_calldata_candidates(
+            let candidates = build_calldata_candidates(
                 ds,
                 req.chain_id,
                 req.input_token,
                 req.output_token,
                 req.taker,
+                req.user,
             )
             .await?;
-            (amount, price_cap, resolved_price_cap, wrap_ratios)
+            (
+                amount,
+                price_cap,
+                resolved_price_cap,
+                wrap_ratios,
+                candidates,
+            )
         }
         SwapCalldataPriceLimit::SlippageBps {
             slippage_bps,
@@ -675,16 +702,17 @@ async fn process_swap_calldata_build(
                     })
                 })
                 .transpose()?;
-            let candidate_build = build_calldata_candidates(
+            let candidates = build_calldata_candidates(
                 ds,
                 req.chain_id,
                 req.input_token,
                 req.output_token,
                 req.taker,
+                req.user,
             )
             .await?;
             let price_cap = super::slippage::resolve_slippage_price_cap(
-                candidate_build.candidates,
+                candidates.0.clone(),
                 req.mode,
                 &amount,
                 slippage_bps,
@@ -712,9 +740,16 @@ async fn process_swap_calldata_build(
                     "swap calldata could not be generated",
                 )
             })?;
-            (amount, price_cap, resolved_price_cap, wrap_ratios)
+            (
+                amount,
+                price_cap,
+                resolved_price_cap,
+                wrap_ratios,
+                candidates,
+            )
         }
     };
+    let (candidates, own_order_count) = candidates;
 
     let take_req = TakeOrdersRequest {
         taker: req.taker.to_string(),
@@ -726,10 +761,23 @@ async fn process_swap_calldata_build(
         price_cap,
     };
 
-    let response = ds
-        .get_calldata_on_chain(req.chain_id, take_req)
-        .await
-        .map_err(map_calldata_boundary_error)?;
+    let executor_response = executor_calldata_without_reverting_orders(
+        ds,
+        req.chain_id,
+        req.taker,
+        req.input_token,
+        &take_req,
+        candidates,
+        own_order_count,
+    )
+    .await?;
+    let response = match executor_response {
+        Some(response) => response,
+        None => ds
+            .get_calldata_on_chain(req.chain_id, take_req)
+            .await
+            .map_err(map_calldata_boundary_error)?,
+    };
     let mut calldata =
         normalize_calldata_response(&wrap_ratios, req.denomination, req.input_token, response)
             .map_err(map_calldata_boundary_error)?;
@@ -747,6 +795,124 @@ async fn process_swap_calldata_build(
         calldata,
         resolved_price_cap,
     })
+}
+
+/// Calldata for the executor contract, built here when the SDK's would
+/// contain an order that must be left out.
+///
+/// The SDK builds executor calldata from its own candidates with no
+/// preflight, so it would hand back an order whose simulated take reverts, or
+/// one owned by the user. `Ok(None)` leaves the request to the SDK: the taker
+/// is not the executor, or nothing had to be left out. When no take executes
+/// at all there is nothing to build.
+async fn executor_calldata_without_reverting_orders(
+    ds: &dyn SwapDataSource,
+    chain_id: u32,
+    taker: Address,
+    input_token: Address,
+    take_req: &TakeOrdersRequest,
+    candidates: Vec<TakeOrderCandidate>,
+    own_order_count: usize,
+) -> Result<Option<SwapCalldataResponse>, ApiError> {
+    if !super::is_executor_taker(chain_id, taker) {
+        return Ok(None);
+    }
+    // Requests the SDK would reject are left for it to reject.
+    let (Ok(mode), Ok(price_cap)) = (
+        ParsedTakeOrdersMode::parse(take_req.mode, &take_req.amount),
+        Float::parse(take_req.price_cap.clone()),
+    ) else {
+        return Ok(None);
+    };
+    let first = match super::slippage::select_best_raindex_simulation(
+        candidates.clone(),
+        mode,
+        price_cap,
+    ) {
+        Ok(first) => first,
+        // The SDK would select from candidates that include the user's
+        // own orders, so it cannot be asked instead.
+        Err(error) if own_order_count > 0 => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let resolved = resolve_executable_take(
+        ds,
+        ExecutableTakeRequest {
+            chain_id,
+            taker,
+            input_token,
+            mode,
+            price_cap,
+        },
+        candidates,
+        first,
+    )
+    .await;
+
+    let simulation_excluded = resolved.take_simulation.excluded_orders.len();
+    match resolved.take_simulation.status {
+        TakeSimulationStatus::Reverts => {
+            tracing::warn!(
+                excluded_order_count = simulation_excluded,
+                revert_data = ?resolved.take_simulation.revert_data,
+                "no simulated take executes; not building executor calldata"
+            );
+            return Err(no_liquidity_error());
+        }
+        // Nothing the SDK's own calldata would get wrong.
+        TakeSimulationStatus::Executes if simulation_excluded == 0 && own_order_count == 0 => {
+            return Ok(None)
+        }
+        // Without a simulation answer the selection is the unsimulated one,
+        // which is what the SDK would build; only ownership forces it here.
+        TakeSimulationStatus::NotSimulated if own_order_count == 0 => return Ok(None),
+        TakeSimulationStatus::Executes | TakeSimulationStatus::NotSimulated => {}
+    }
+
+    let failed = |error: &dyn std::fmt::Display| {
+        tracing::error!(%error, "failed to build executor calldata from selection");
+        ApiError::coded(
+            ApiErrorCode::SwapCalldataFailed,
+            "swap calldata could not be generated",
+        )
+    };
+    let estimated_input = resolved
+        .simulation
+        .total_input
+        .format()
+        .map_err(|error| failed(&error))?;
+    let raindex = resolved
+        .simulation
+        .legs
+        .first()
+        .map(|leg| leg.candidate.raindex);
+    let built = build_take_orders_config_from_simulation(resolved.simulation, mode, price_cap)
+        .map_err(|error| failed(&error))?;
+    let (Some(raindex), Some(built)) = (raindex, built) else {
+        return Err(failed(&"selection has no legs"));
+    };
+    tracing::info!(
+        %raindex,
+        order_count = built.config.orders.len(),
+        simulation_excluded_order_count = simulation_excluded,
+        own_order_count,
+        simulation_status = ?resolved.take_simulation.status,
+        "built executor calldata without orders that must be left out"
+    );
+    Ok(Some(SwapCalldataResponse {
+        chain_id,
+        to: raindex,
+        data: Bytes::from(
+            takeOrders4Call {
+                config: built.config,
+            }
+            .abi_encode(),
+        ),
+        value: alloy::primitives::U256::ZERO,
+        estimated_input,
+        denomination: crate::types::swap::SwapDenomination::Wrapped,
+        approvals: vec![],
+    }))
 }
 
 /// Replace oracle signed context in executable takeOrders calldata with a
@@ -1014,6 +1180,7 @@ mod tests {
         SwapCalldataV2Request {
             chain_id: Some(8453),
             taker: TAKER,
+            user: None,
             input_token: USDC,
             output_token: WETH,
             mode,
@@ -1052,6 +1219,7 @@ mod tests {
         SwapCalldataV2Request {
             chain_id: Some(8453),
             taker: TAKER,
+            user: None,
             input_token,
             output_token,
             mode,
@@ -1071,6 +1239,7 @@ mod tests {
         SwapCalldataV2Request {
             chain_id: Some(8453),
             taker: TAKER,
+            user: None,
             input_token: USDC,
             output_token: WETH,
             mode,
@@ -1967,7 +2136,9 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn test_process_swap_calldata_v2_slippage_rejects_incomplete_price_basis() {
+    async fn test_process_swap_calldata_v2_slippage_prices_from_executable_candidates() {
+        // An order whose oracle can't be fetched can't be taken: the cap comes from the
+        // executable candidates (2 + 50 bps) instead of failing the whole pair.
         let (ds, captured_request) = capture_candidate_outcome_ds(
             vec![mock_candidate("100", "2")],
             vec![super::super::SwapQuoteFailure::OracleUnavailable],
@@ -1977,10 +2148,12 @@ mod tests {
             &ds,
             slippage_v2_request(SwapCalldataMode::SpendExact, "100", 50),
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
-        no_take_orders_request_was_made(&captured_request);
+        let request = captured_take_orders_request(&captured_request);
+        assert_eq!(request.price_cap, "2.01");
+        assert_eq!(result.resolved_price_cap, "2.01");
     }
 
     #[rocket::async_test]

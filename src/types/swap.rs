@@ -1,5 +1,5 @@
 use crate::types::common::Approval;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -58,6 +58,13 @@ pub struct SwapQuoteV2Request {
     /// building their signed context.
     #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Option<Address>,
+    /// The person the trade is for. When `taker` is the API's executor
+    /// contract, orders owned by this address are never selected, so nobody
+    /// is routed into their own order. With any other `taker` it has no
+    /// effect. Omit it and no order is left out by ownership.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub user: Option<Address>,
     /// Token the taker will spend.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
@@ -128,6 +135,13 @@ pub struct SwapQuoteV2RequestCommon {
     /// orders, whose signed context can depend on the taker.
     #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Option<Address>,
+    /// The person the trade is for. When `taker` is the API's executor
+    /// contract, orders owned by this address are never selected, so nobody
+    /// is routed into their own order. With any other `taker` it has no
+    /// effect. Omit it and no order is left out by ownership.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub user: Option<Address>,
     /// Token the taker will spend.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
@@ -211,6 +225,92 @@ pub struct SwapQuoteV2Response {
     /// `priceCap` on the retry so the limit does not move.
     #[schema(example = "2512.5")]
     pub resolved_price_cap: String,
+    /// Result of simulating the `takeOrders4` call this quote leads to, from
+    /// `taker`. A quote only evaluates each order's calculate-io; this runs
+    /// the whole take, including each order's handle-io. When `status` is
+    /// `executes`, the estimates above describe the simulated take, with
+    /// `excludedOrders` already left out.
+    pub take_simulation: TakeSimulation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TakeSimulationStatus {
+    /// The simulated take of the quoted route executed.
+    Executes,
+    /// No take that executes was found. `fullyFilled` is `false`.
+    Reverts,
+    /// No simulation result is available; see `reason`. This says nothing
+    /// about whether the take would execute.
+    NotSimulated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TakeSimulationSkipReason {
+    /// The quote request named no `taker`.
+    NoTaker,
+    /// The input token's balance or allowance storage could not be located,
+    /// so the taker could not be funded for the simulation.
+    OverrideUnavailable,
+    /// The chain data provider failed or answered ambiguously.
+    RpcUnavailable,
+    /// The simulation did not finish in time.
+    TimedOut,
+    /// Reverting orders were still being found when the round limit was hit.
+    RoundsExhausted,
+    /// The take could not be assembled from the quote.
+    BuildFailed,
+}
+
+/// An order left out of the route because taking it reverts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExcludedOrder {
+    #[schema(value_type = String, example = "0x23015e87f07fb96cdf41dfb49861f8bc637b0a03f3c7f96ae3070e3845217315")]
+    pub order_hash: B256,
+    /// Raw revert data returned by the chain when this order was taken.
+    #[schema(value_type = String, example = "0x08c379a0...")]
+    pub revert_data: Bytes,
+    /// The revert string, verbatim, when `revertData` is a standard
+    /// `Error(string)`. Data from the order, not an API message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Min trade amount")]
+    pub revert_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeSimulation {
+    #[schema(example = "executes")]
+    pub status: TakeSimulationStatus,
+    /// Why there is no result. Present only for `notSimulated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "noTaker")]
+    pub reason: Option<TakeSimulationSkipReason>,
+    /// Raw revert data of the last simulated take. Present for `reverts` when
+    /// the take reverts as a whole and no single order could be blamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, example = "0x08c379a0...")]
+    pub revert_data: Option<Bytes>,
+    /// `revertData` as a string when it is a standard `Error(string)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert_reason: Option<String>,
+    /// Orders that revert when taken on their own and were left out.
+    #[serde(default)]
+    pub excluded_orders: Vec<ExcludedOrder>,
+}
+
+impl TakeSimulation {
+    pub fn not_simulated(reason: TakeSimulationSkipReason) -> Self {
+        Self {
+            status: TakeSimulationStatus::NotSimulated,
+            reason: Some(reason),
+            revert_data: None,
+            revert_reason: None,
+            excluded_orders: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -253,6 +353,13 @@ pub struct SwapCalldataV2Request {
     /// Wallet that will execute the swap and whose allowance is checked.
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
+    /// The person the trade is for. When `taker` is the API's executor
+    /// contract, orders owned by this address are never selected, so nobody
+    /// is routed into their own order. With any other `taker` it has no
+    /// effect. Omit it and no order is left out by ownership.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub user: Option<Address>,
     /// Token the taker will spend.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,
@@ -318,6 +425,13 @@ pub struct SwapCalldataV2RequestCommon {
     /// Wallet that will execute the swap and whose allowance is checked.
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub taker: Address,
+    /// The person the trade is for. When `taker` is the API's executor
+    /// contract, orders owned by this address are never selected, so nobody
+    /// is routed into their own order. With any other `taker` it has no
+    /// effect. Omit it and no order is left out by ownership.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "0x1234567890abcdef1234567890abcdef12345678")]
+    pub user: Option<Address>,
     /// Token the taker will spend.
     #[schema(value_type = String, example = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")]
     pub input_token: Address,

@@ -51,6 +51,20 @@ pub enum OrderSummaryOrderType {
     Dca,
     DynamicSpread,
     Custom,
+    /// The River's buy-the-dip ladder (river-ladder).
+    Ladder,
+    /// The River's DIA-triggered stop-loss (river-stop).
+    Stop,
+    /// The River's buy/sell cycle (river-cycle).
+    Cycle,
+    /// The River's oracle-pegged buy (river-peg).
+    Peg,
+    /// The River's automated portfolio (river-basket).
+    Basket,
+    /// The River's buy-on-breakout (river-stop-buy).
+    StopBuy,
+    /// The River's two-sided quotes around the oracle (river-spread).
+    Spread,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize, IntoParams)]
@@ -156,6 +170,11 @@ pub struct OrderSummary {
     pub created_at: u64,
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub orderbook_id: Address,
+    /// The order's Rainlang from its onchain meta (falls back to the dotrain source), for
+    /// classifying strategy type. Only on /orders/owner; omitted when the order has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "#calculate-io\nmax-output: 100,\nio-ratio: 0.0005;\n#handle-io\n:;")]
+    pub rainlang: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

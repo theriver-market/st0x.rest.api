@@ -1,5 +1,7 @@
 use super::{
-    capture_swap_outcome, ensure_distinct_tokens, exchange_log::SwapExchangeLog,
+    capture_swap_outcome, ensure_distinct_tokens,
+    exchange_log::SwapExchangeLog,
+    executable::{resolve_executable_take, ExecutableTakeRequest},
     no_liquidity_error, request_chain_id, snapshot_swap_context, RaindexSwapDataSource,
     SwapAnalyticsContext, SwapCandidateBuild, SwapDataSource,
 };
@@ -18,7 +20,7 @@ use crate::routes::swap::denomination::{
 use crate::swap_capacity::SwapCapacity;
 use crate::types::swap::{
     SwapQuoteRequest, SwapQuoteResponse, SwapQuoteV2Request, SwapQuoteV2RequestBody,
-    SwapQuoteV2Response,
+    SwapQuoteV2Response, TakeSimulation, TakeSimulationSkipReason, TakeSimulationStatus,
 };
 use alloy::primitives::{fixed_bytes, Address};
 use rain_math_float::Float;
@@ -381,7 +383,7 @@ async fn process_swap_quote(
     })
 }
 
-async fn process_swap_quote_v2(
+pub(super) async fn process_swap_quote_v2(
     ds: &dyn SwapDataSource,
     req: SwapQuoteV2Request,
 ) -> Result<SwapQuoteV2Response, ApiError> {
@@ -420,7 +422,7 @@ async fn process_swap_quote_v2(
     }
 
     let SwapCandidateBuild {
-        candidates,
+        mut candidates,
         failures,
     } = ds
         .build_candidates_for_pair(
@@ -431,6 +433,10 @@ async fn process_swap_quote_v2(
         )
         .await
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
+    super::exclude_orders_owned_by(
+        &mut candidates,
+        super::user_for_selection(chain_id, req.taker, req.user),
+    );
     if candidates.is_empty() {
         return Err(failures
             .oracle_unavailable_error()
@@ -456,9 +462,10 @@ async fn process_swap_quote_v2(
             slippage_bps,
             reference_io_ratio,
         } => {
-            if let Some(error) = failures.oracle_unavailable_error() {
-                return Err(error);
-            }
+            // An order whose oracle can't be fetched can't be taken either, so the
+            // executable candidates are the whole executable book: price from them.
+            // (River 7 Oct: one NVDA order with a retired oracle URL 503'd every NVDA
+            // quote while a live order could fill.) Shortfalls still report the oracle.
             let reference_io_ratio = reference_io_ratio
                 .map(|reference_io_ratio| {
                     normalize_calldata_price_cap(
@@ -494,7 +501,7 @@ async fn process_swap_quote_v2(
     let is_exact_mode = parsed_mode.is_exact_mode();
     let target_amount = parsed_mode.target_amount();
     let simulation =
-        super::slippage::select_best_raindex_simulation(candidates, parsed_mode, price_cap)
+        super::slippage::select_best_raindex_simulation(candidates.clone(), parsed_mode, price_cap)
             .map_err(|error| {
                 if matches!(
                     &error,
@@ -508,13 +515,41 @@ async fn process_swap_quote_v2(
                     error
                 }
             })?;
+    // The selection above only reflects each order's calculate-io. Simulate
+    // the take itself, leaving out orders that revert when taken.
+    let (simulation, take_simulation) = match req.taker {
+        Some(taker) => {
+            let resolved = resolve_executable_take(
+                ds,
+                ExecutableTakeRequest {
+                    chain_id,
+                    taker,
+                    input_token: req.input_token,
+                    mode: parsed_mode,
+                    price_cap,
+                },
+                candidates,
+                simulation,
+            )
+            .await;
+            (resolved.simulation, resolved.take_simulation)
+        }
+        None => (
+            simulation,
+            TakeSimulation::not_simulated(TakeSimulationSkipReason::NoTaker),
+        ),
+    };
+    let take_reverts = take_simulation.status == TakeSimulationStatus::Reverts;
     let achieved_amount = if is_buy_mode {
         simulation.total_output
     } else {
         simulation.total_input
     };
-    let fully_filled = is_quote_fully_filled(achieved_amount, target_amount, is_exact_mode)?;
-    if !fully_filled {
+    // A route whose take reverts fills nothing, whatever calculate-io says.
+    // It is still returned (even in exact modes) so the reasons reach the caller.
+    let fully_filled =
+        !take_reverts && is_quote_fully_filled(achieved_amount, target_amount, is_exact_mode)?;
+    if !fully_filled && !take_reverts {
         let requested = target_amount.format().map_err(|error| {
             tracing::error!(%error, "failed to format requested quote amount");
             quote_failed_error()
@@ -575,6 +610,7 @@ async fn process_swap_quote_v2(
         estimated_io_ratio: format_estimate(estimated_io_ratio, "estimated IO ratio")?,
         fully_filled,
         resolved_price_cap,
+        take_simulation,
     })
 }
 
@@ -716,6 +752,7 @@ mod tests {
         SwapQuoteV2Request {
             chain_id: Some(8453),
             taker: None,
+            user: None,
             input_token: USDC,
             output_token: WETH,
             mode,
@@ -1701,5 +1738,108 @@ mod tests {
         assert_eq!(response.status(), Status::BadRequest);
         let body = response.into_json::<ApiErrorResponse>().await.unwrap();
         assert_eq!(body.error.message, "chainId is required");
+    }
+
+    /// A malformed `user` is rejected exactly like a malformed `taker`.
+    #[rocket::async_test]
+    async fn test_v3_swap_quote_and_calldata_reject_malformed_user_like_malformed_taker() {
+        let client = TestClientBuilder::new().build().await;
+        let (key_id, secret) = crate::test_helpers::seed_api_key(&client).await;
+        let header = crate::test_helpers::basic_auth_header(&key_id, &secret);
+        let body = |field: &str| {
+            let mut body = serde_json::json!({
+                "chainId": 8453,
+                "taker": "0x1111111111111111111111111111111111111111",
+                "user": "0x2222222222222222222222222222222222222222",
+                "inputToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "outputToken": "0x4200000000000000000000000000000000000006",
+                "mode": "spendExact",
+                "amount": "100",
+                "priceCap": "2500",
+            });
+            body[field] = serde_json::json!("0x1234");
+            body.to_string()
+        };
+
+        for path in ["/v3/swap/quote", "/v3/swap/calldata", "/v2/swap/quote"] {
+            let mut responses = Vec::new();
+            for field in ["taker", "user"] {
+                let response = client
+                    .post(path)
+                    .header(ContentType::JSON)
+                    .header(rocket::http::Header::new("Authorization", header.clone()))
+                    .body(body(field))
+                    .dispatch()
+                    .await;
+                assert_eq!(
+                    response.status(),
+                    Status::UnprocessableEntity,
+                    "{path} {field}"
+                );
+                let error = response
+                    .into_json::<ApiErrorResponse>()
+                    .await
+                    .unwrap()
+                    .error;
+                responses.push((error.code, error.message));
+            }
+            assert_eq!(responses[0], responses[1], "{path}");
+        }
+    }
+
+    /// Read-only check against a live chain: quotes through the real data
+    /// source and prints the response, take simulation included.
+    ///
+    /// `TAKE_SIM_SETTINGS` is the path of a raindex settings YAML (subgraph
+    /// mode, no local-db sections). The other variables default to the
+    /// 13 Oct 2026 wtSPYM sell that quoted as fully filled and then reverted
+    /// with "Min trade amount". Run with:
+    /// `TAKE_SIM_SETTINGS=... cargo test live_take_simulation -- --ignored --nocapture`
+    #[rocket::async_test]
+    #[ignore = "live: reads a public chain RPC and the order subgraph"]
+    async fn live_take_simulation() {
+        let var = |name: &str, default: &str| std::env::var(name).unwrap_or(default.to_string());
+        let settings = std::fs::read_to_string(var("TAKE_SIM_SETTINGS", "")).unwrap();
+        let client =
+            rain_orderbook_common::raindex_client::RaindexClient::new(vec![settings], None, None)
+                .await
+                .unwrap();
+        let pool = crate::db::init("sqlite::memory:", 1).await.unwrap();
+        let caches = crate::cache::RouteResponseCaches::new(0, std::time::Duration::ZERO);
+        let ds = RaindexSwapDataSource::new(&client, &caches, &pool);
+        let request = SwapQuoteV2Request {
+            chain_id: Some(8453),
+            taker: Some(
+                var(
+                    "TAKE_SIM_TAKER",
+                    "0xd2843d9e7738d46d90cb6dff8d6c83db58b9c165",
+                )
+                .parse()
+                .unwrap(),
+            ),
+            user: std::env::var("TAKE_SIM_USER")
+                .ok()
+                .map(|user| user.parse().unwrap()),
+            input_token: var(
+                "TAKE_SIM_INPUT_TOKEN",
+                "0x31c2c14134e6e3b7ef9478297f199331133fc2d8",
+            )
+            .parse()
+            .unwrap(),
+            output_token: var("TAKE_SIM_OUTPUT_TOKEN", &USDC.to_string())
+                .parse()
+                .unwrap(),
+            mode: SwapCalldataMode::SpendUpTo,
+            amount: var("TAKE_SIM_AMOUNT", "0.172879"),
+            price_cap: None,
+            slippage_bps: Some(50),
+            reference_io_ratio: None,
+            denomination: SwapDenomination::Wrapped,
+        };
+
+        match process_swap_quote_v2(&ds, request).await {
+            Ok(response) => println!("{}", serde_json::to_string_pretty(&response).unwrap()),
+            Err(error) => println!("quote error: {error:?}"),
+        }
     }
 }

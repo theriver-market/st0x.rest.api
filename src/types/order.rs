@@ -193,6 +193,11 @@ pub struct OrderDetail {
     #[schema(value_type = String, example = "0x1234567890abcdef1234567890abcdef12345678")]
     pub orderbook_id: Address,
     pub trades: Vec<OrderTradeEntry>,
+    /// The order's Rainlang from its onchain meta (falls back to the dotrain source), for
+    /// classifying strategy type. Omitted when the order has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "#calculate-io\nmax-output: 100,\nio-ratio: 0.0005;\n#handle-io\n:;")]
+    pub rainlang: Option<String>,
 }
 
 #[cfg(test)]

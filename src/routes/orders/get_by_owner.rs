@@ -53,7 +53,7 @@ pub(crate) async fn process_get_orders_by_owner(
     let quote_results = get_order_quotes_for_summaries(ds, &orders).await;
     let wrap_ratios = current_wrap_ratios_for_orders(ds, denomination, &orders).await?;
 
-    build_orders_list_response(
+    let mut response = build_orders_list_response(
         &orders,
         total_count,
         page_num.into(),
@@ -61,7 +61,12 @@ pub(crate) async fn process_get_orders_by_owner(
         quote_results,
         denomination,
         &wrap_ratios,
-    )
+    )?;
+    // Owner lists carry each order's Rainlang so the site can group strategies.
+    for (summary, order) in response.orders.iter_mut().zip(&orders) {
+        summary.rainlang = super::order_source(order);
+    }
+    Ok(response)
 }
 
 #[utoipa::path(
@@ -129,13 +134,17 @@ pub async fn get_orders_by_address(
 mod tests {
     use super::*;
     use crate::routes::order::test_fixtures::{
-        mock_order, mock_order_with_shared_vaults, mock_quote,
+        mock_inactive_order_with_rainlang, mock_order, mock_order_with_rainlang,
+        mock_order_with_shared_vaults, mock_quote, RIVER_PEG_RAINLANG,
     };
     use crate::routes::orders::test_fixtures::{
         MockOrdersListDataSource, RecordingOrdersListDataSource,
     };
     use crate::test_helpers::{basic_auth_header, seed_api_key, TestClientBuilder};
     use crate::types::orders::OrderSummaryOrderType;
+    use alloy::primitives::{address, B256};
+    use rain_orderbook_common::raindex_client::order_quotes::RaindexOrderQuote;
+    use rain_orderbook_common::raindex_client::orders::RaindexOrder;
     use rocket::http::{Header, Status};
 
     #[rocket::async_test]
@@ -293,6 +302,174 @@ mod tests {
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].active, None);
         assert_eq!(filters[0].has_positive_output_vault_balance, None);
+    }
+
+    /// Applies `filters.active` like the SDK does (None = all orders).
+    struct FilteringOrdersListDataSource {
+        orders: Vec<RaindexOrder>,
+    }
+
+    #[async_trait::async_trait]
+    impl OrdersListDataSource for FilteringOrdersListDataSource {
+        async fn get_orders_list(
+            &self,
+            _chain_ids: Option<Vec<u32>>,
+            filters: GetOrdersFilters,
+            _page: Option<u16>,
+            _page_size: Option<u16>,
+        ) -> Result<(Vec<RaindexOrder>, u32), ApiError> {
+            let orders: Vec<RaindexOrder> = self
+                .orders
+                .iter()
+                .filter(|order| filters.active.is_none_or(|active| order.active() == active))
+                .cloned()
+                .collect();
+            let total = orders.len() as u32;
+            Ok((orders, total))
+        }
+
+        async fn get_order_quotes(
+            &self,
+            _order: &RaindexOrder,
+        ) -> Result<Vec<RaindexOrderQuote>, ApiError> {
+            Ok(vec![mock_quote("1.5")])
+        }
+    }
+
+    const INACTIVE_HASH: &str =
+        "0x000000000000000000000000000000000000000000000000000000000000dead";
+
+    fn active_and_inactive() -> FilteringOrdersListDataSource {
+        FilteringOrdersListDataSource {
+            orders: vec![
+                mock_order_with_rainlang(RIVER_PEG_RAINLANG),
+                mock_inactive_order_with_rainlang(INACTIVE_HASH, 1_700_000_500, "inactive-src"),
+            ],
+        }
+    }
+
+    fn owner() -> Address {
+        address!("0000000000000000000000000000000000000001")
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_owner_state_all_returns_inactive_orders() {
+        let ds = active_and_inactive();
+        let result = process_get_orders_by_owner(
+            &ds,
+            None,
+            owner(),
+            Some(OrderState::All),
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.orders.len(), 2);
+        assert_eq!(result.pagination.total_orders, 2);
+        assert!(result.orders[0].active);
+        let inactive = &result.orders[1];
+        assert!(!inactive.active);
+        assert_eq!(inactive.order_hash, INACTIVE_HASH.parse::<B256>().unwrap());
+        assert_eq!(inactive.removed_at, Some(1_700_000_500));
+        assert_eq!(inactive.output_vault_balance, "0");
+        assert_eq!(inactive.rainlang.as_deref(), Some("inactive-src"));
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_owner_default_state_is_active_only() {
+        let ds = active_and_inactive();
+        let result = process_get_orders_by_owner(
+            &ds,
+            None,
+            owner(),
+            None,
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.orders.len(), 1);
+        assert!(result.orders[0].active);
+
+        let result = process_get_orders_by_owner(
+            &ds,
+            None,
+            owner(),
+            Some(OrderState::Inactive),
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.orders.len(), 1);
+        assert!(!result.orders[0].active);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_get_orders_by_owner_includes_rainlang() {
+        let ds = MockOrdersListDataSource {
+            orders: Ok(vec![
+                mock_order_with_rainlang(RIVER_PEG_RAINLANG),
+                mock_order(),
+            ]),
+            total_count: 2,
+            quotes: Ok(vec![mock_quote("1.5")]),
+        };
+        let result = process_get_orders_by_owner(
+            &ds,
+            None,
+            owner(),
+            None,
+            None,
+            None,
+            Denomination::Wrapped,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.orders[0].rainlang.as_deref(),
+            Some(RIVER_PEG_RAINLANG)
+        );
+        assert_eq!(result.orders[0].order_type, OrderSummaryOrderType::Peg);
+        assert_eq!(result.orders[1].rainlang, None);
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["orders"][0]["rainlang"], RIVER_PEG_RAINLANG);
+        assert_eq!(json["orders"][0]["orderType"], "peg");
+        // No source -> field omitted; existing fields keep their shape.
+        assert!(json["orders"][1].get("rainlang").is_none());
+        let mut keys: Vec<&str> = json["orders"][1]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "active",
+                "chainId",
+                "createdAt",
+                "inputToken",
+                "ioRatio",
+                "maxOutput",
+                "orderBytes",
+                "orderHash",
+                "orderType",
+                "orderbookId",
+                "outputToken",
+                "outputVaultBalance",
+                "owner",
+                "removedAt",
+            ]
+        );
     }
 
     #[rocket::async_test]

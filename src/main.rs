@@ -20,8 +20,10 @@ mod market_price;
 mod metrics;
 mod raindex;
 mod registry_artifact;
+mod river_takes;
 mod routes;
 mod swap_capacity;
+mod take_simulation;
 mod telemetry;
 mod types;
 mod wrap_ratio;
@@ -250,6 +252,8 @@ enum StartupRegistryError {
         routes::orders::post_orders_query,
         routes::vaults::get_vaults,
         routes::vaults::get_vault_totals,
+        routes::vaults::get_vault_changes,
+        routes::owners::get_owner_vault_changes,
         routes::admin::put_registry,
         routes::attribution_admin::get_attributed_executions,
         routes::attribution_admin::get_attribution_volume,
@@ -257,6 +261,7 @@ enum StartupRegistryError {
         routes::trades::query::post_trades_query,
         routes::trades::get_by_token::get_trades_by_token,
         routes::trades::get_by_taker::get_trades_by_taker,
+        routes::trades::get_recent::get_recent_trades,
         routes::trades::get_by_address::get_trades_by_address,
         routes::registry::get_registry,
         routes::registry::get_registry_history,
@@ -363,6 +368,8 @@ pub(crate) fn rocket(
         .mount("/v2/orders", routes::orders::routes_v2())
         .mount("/v1/vaults", routes::vaults::routes())
         .mount("/v2/vaults", routes::vaults::routes_v2())
+        .mount("/v1/owners", routes::owners::routes())
+        .mount("/v2/owners", routes::owners::routes())
         .mount("/v1/trades", routes::trades::routes())
         .mount("/v2/trades", routes::trades::routes_v2())
         .mount("/", routes::registry::routes())
@@ -612,6 +619,16 @@ async fn main() {
                 };
 
             let shared_raindex = std::sync::Arc::new(tokio::sync::RwLock::new(raindex_config));
+            {
+                let rpcs = shared_raindex
+                    .read()
+                    .await
+                    .raindex_yaml()
+                    .get_network_by_chain_id(river_takes::RIVER_TAKER_CHAIN_ID)
+                    .map(|network| network.rpcs)
+                    .unwrap_or_default();
+                tokio::spawn(river_takes::supervise(pool.clone(), rpcs));
+            }
             let rate_limiter =
                 fairings::RateLimiter::new(cfg.rate_limit_global_rpm, cfg.rate_limit_per_key_rpm);
             let swap_capacity = swap_capacity::SwapCapacity::new(

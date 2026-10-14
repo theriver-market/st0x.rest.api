@@ -182,14 +182,22 @@ pub struct OrderbookSyncInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_message: Option<String>,
 
-    /// Last block number persisted by raindex for this orderbook.
+    /// Last block number persisted by raindex for this orderbook. Left out when unknown;
+    /// `sync_position_error` then says why.
     #[schema(example = 12345678)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced_block: Option<u64>,
 
-    /// Timestamp when raindex last updated the persisted sync status.
+    /// UTC time (`YYYY-MM-DD HH:MM:SS`) raindex last wrote the persisted sync position.
+    /// Left out when unknown; `sync_position_error` then says why.
+    #[schema(example = "2026-10-13 11:15:02")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+
+    /// Why `last_synced_block` / `updated_at` are missing. Left out when they are present.
+    #[schema(example = "no sync watermark row for this orderbook")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sync_position_error: Option<String>,
 
     /// Error message if this orderbook failed.
     #[serde(skip_serializing_if = "Option::is_none")]
