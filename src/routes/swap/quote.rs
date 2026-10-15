@@ -327,16 +327,9 @@ async fn process_swap_quote(
         quote_failed_error()
     })?;
 
+    // Some orders were quoted, so their answer stands (see process_swap_quote_v2).
     if sim.legs.is_empty() {
-        return Err(failures
-            .oracle_unavailable_error()
-            .unwrap_or_else(no_liquidity_error));
-    }
-
-    if !is_quote_fully_filled(sim.total_output, buy_target, false)? {
-        if let Some(error) = failures.oracle_unavailable_error() {
-            return Err(error);
-        }
+        return Err(no_liquidity_error());
     }
 
     let (estimated_input, estimated_output) = normalize_quote_amounts(
@@ -437,6 +430,12 @@ pub(super) async fn process_swap_quote_v2(
         &mut candidates,
         super::user_for_selection(chain_id, req.taker, req.user),
     );
+    // The oracle error is the answer only when no order could be quoted. Once
+    // some were, they are the executable book (an order whose oracle can't be
+    // fetched can't be taken either), so a shortfall or a price-cap miss is
+    // answered from them, with what is available (prod 15 Oct, request
+    // 3a236260: a $10k NVDA buy with $2,242 on offer and 1 of 4 orders on a
+    // retired oracle URL answered 503 SWAP_ORACLE_UNAVAILABLE).
     if candidates.is_empty() {
         return Err(failures
             .oracle_unavailable_error()
@@ -465,7 +464,7 @@ pub(super) async fn process_swap_quote_v2(
             // An order whose oracle can't be fetched can't be taken either, so the
             // executable candidates are the whole executable book: price from them.
             // (River 7 Oct: one NVDA order with a retired oracle URL 503'd every NVDA
-            // quote while a live order could fill.) Shortfalls still report the oracle.
+            // quote while a live order could fill.)
             let reference_io_ratio = reference_io_ratio
                 .map(|reference_io_ratio| {
                     normalize_calldata_price_cap(
@@ -500,21 +499,11 @@ pub(super) async fn process_swap_quote_v2(
     let is_buy_mode = parsed_mode.is_buy_mode();
     let is_exact_mode = parsed_mode.is_exact_mode();
     let target_amount = parsed_mode.target_amount();
-    let simulation =
-        super::slippage::select_best_raindex_simulation(candidates.clone(), parsed_mode, price_cap)
-            .map_err(|error| {
-                if matches!(
-                    &error,
-                    ApiError::Coded {
-                        code: ApiErrorCode::SwapNoLiquidity,
-                        ..
-                    }
-                ) {
-                    failures.oracle_unavailable_error().unwrap_or(error)
-                } else {
-                    error
-                }
-            })?;
+    let simulation = super::slippage::select_best_raindex_simulation(
+        candidates.clone(),
+        parsed_mode,
+        price_cap,
+    )?;
     // The selection above only reflects each order's calculate-io. Simulate
     // the take itself, leaving out orders that revert when taken.
     let (simulation, take_simulation) = match req.taker {
@@ -559,9 +548,6 @@ pub(super) async fn process_swap_quote_v2(
             quote_failed_error()
         })?;
         tracing::warn!(%requested, %available, "insufficient executable liquidity");
-        if let Some(error) = failures.oracle_unavailable_error() {
-            return Err(error);
-        }
         if is_exact_mode {
             return Err(no_liquidity_error());
         }
@@ -1577,19 +1563,20 @@ mod tests {
     }
 
     #[rocket::async_test]
-    async fn test_process_swap_quote_partial_fill_reports_oracle_unavailable() {
+    async fn test_process_swap_quote_partial_fill_beats_unavailable_oracle() {
         let ds = candidate_outcome_data_source(
             vec![mock_candidate("3", "2")],
             vec![super::super::SwapQuoteFailure::OracleUnavailable],
         );
 
-        let result = process_swap_quote(&ds, quote_request("8")).await;
+        let result = process_swap_quote(&ds, quote_request("8")).await.unwrap();
 
-        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+        assert_eq!(result.estimated_output, "3");
+        assert_eq!(result.estimated_input, "6");
     }
 
     #[rocket::async_test]
-    async fn test_process_swap_quote_v2_exact_shortfall_reports_oracle_unavailable() {
+    async fn test_process_swap_quote_v2_exact_shortfall_beats_unavailable_oracle() {
         let ds = candidate_outcome_data_source(
             vec![mock_candidate("3", "2")],
             vec![super::super::SwapQuoteFailure::OracleUnavailable],
@@ -1598,11 +1585,11 @@ mod tests {
         let result =
             process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::SpendExact, "8")).await;
 
-        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
     #[rocket::async_test]
-    async fn test_process_swap_quote_v2_incomplete_price_cap_filter_reports_oracle_unavailable() {
+    async fn test_process_swap_quote_v2_price_cap_miss_beats_unavailable_oracle() {
         let ds = candidate_outcome_data_source(
             vec![mock_candidate("100", "3")],
             vec![super::super::SwapQuoteFailure::OracleUnavailable],
@@ -1611,20 +1598,98 @@ mod tests {
         let result =
             process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::BuyUpTo, "5")).await;
 
-        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
     #[rocket::async_test]
-    async fn test_process_swap_quote_v2_up_to_shortfall_reports_oracle_unavailable() {
+    async fn test_process_swap_quote_v2_up_to_shortfall_beats_unavailable_oracle() {
         let ds = candidate_outcome_data_source(
             vec![mock_candidate("3", "2")],
             vec![super::super::SwapQuoteFailure::OracleUnavailable],
         );
 
-        let result =
-            process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::SpendUpTo, "8")).await;
+        let result = process_swap_quote_v2(&ds, quote_v2_request(SwapCalldataMode::SpendUpTo, "8"))
+            .await
+            .unwrap();
 
-        assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+        assert!(!result.fully_filled);
+        assert_eq!(result.estimated_input, "6");
+        assert_eq!(result.estimated_output, "3");
+    }
+
+    /// Prod 15 Oct, request 3a236260: a $10,000 NVDA buy, 4 orders, 1 whose oracle
+    /// 404s (retired oracle URL), the other 3 quoted with $2,242 of depth. The
+    /// answer must be the shortfall with what is available, not 503.
+    fn incident_3a236260_data_source(
+        failures: Vec<super::super::SwapQuoteFailure>,
+    ) -> CandidateOutcomeDataSource {
+        let mut ds = candidate_outcome_data_source(
+            vec![
+                mock_candidate("3", "2"),
+                mock_candidate("2", "2"),
+                mock_candidate("1", "2"),
+            ],
+            failures,
+        );
+        ds.base.orders = Ok(vec![mock_order(), mock_order(), mock_order(), mock_order()]);
+        ds
+    }
+
+    fn incident_3a236260_request(mode: SwapCalldataMode) -> SwapQuoteV2Request {
+        SwapQuoteV2Request {
+            price_cap: None,
+            slippage_bps: Some(100),
+            ..quote_v2_request(mode, "50")
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_up_to_shortfall_beats_one_unavailable_oracle() {
+        let ds =
+            incident_3a236260_data_source(vec![super::super::SwapQuoteFailure::OracleUnavailable]);
+
+        let result =
+            process_swap_quote_v2(&ds, incident_3a236260_request(SwapCalldataMode::SpendUpTo))
+                .await
+                .unwrap();
+
+        assert!(!result.fully_filled);
+        assert_eq!(result.amount, "50");
+        assert_eq!(result.estimated_input, "12");
+        assert_eq!(result.estimated_output, "6");
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_exact_shortfall_beats_one_unavailable_oracle() {
+        let ds =
+            incident_3a236260_data_source(vec![super::super::SwapQuoteFailure::OracleUnavailable]);
+
+        let result =
+            process_swap_quote_v2(&ds, incident_3a236260_request(SwapCalldataMode::SpendExact))
+                .await;
+
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_every_oracle_unavailable_is_503() {
+        let mut ds = candidate_outcome_data_source(
+            Vec::new(),
+            vec![super::super::SwapQuoteFailure::OracleUnavailable; 4],
+        );
+        ds.base.orders = Ok(vec![mock_order(), mock_order(), mock_order(), mock_order()]);
+
+        for mode in [SwapCalldataMode::SpendUpTo, SwapCalldataMode::SpendExact] {
+            let result = process_swap_quote_v2(&ds, incident_3a236260_request(mode)).await;
+            let Err(error) = result else {
+                panic!("every oracle down must not quote");
+            };
+            assert_eq!(error.code(), ApiErrorCode::SwapOracleUnavailable);
+            assert_eq!(
+                error.code().status(),
+                rocket::http::Status::ServiceUnavailable
+            );
+        }
     }
 
     #[rocket::async_test]

@@ -85,9 +85,12 @@ and execution.
 clients. Omitting `chainId` selects Base (`8453`). Use V3 for any other network.
 
 Oracle-backed orders can be temporarily unavailable for evaluation when their
-external context fetch fails. Quote endpoints then return HTTP 503 with
-`SWAP_ORACLE_UNAVAILABLE`. This is distinct from HTTP 404 `SWAP_NO_LIQUIDITY`,
-which means the evaluated order set has no executable capacity for the request.
+external context fetch fails. When no order for the pair could be quoted because
+of that, quote endpoints return HTTP 503 with `SWAP_ORACLE_UNAVAILABLE`. When
+other orders were quoted, those orders answer: a full fill, an up-to quote with
+`fullyFilled: false` and the amount available, or HTTP 404 `SWAP_NO_LIQUIDITY`
+for an exact request they cannot fill. `SWAP_NO_LIQUIDITY` means the evaluated
+order set has no executable capacity for the request.
 
 ### Understanding Price Limits
 
