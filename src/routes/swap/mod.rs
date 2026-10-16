@@ -1084,6 +1084,39 @@ mod tests {
     }
 
     #[test]
+    fn test_circuit_open_order_is_an_unavailable_oracle_beside_quoted_liquidity() {
+        let dead_order = single_pair_order(
+            crate::test_helpers::WT_MSTR,
+            crate::test_helpers::USDC,
+            "0x1000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let live_order = single_pair_order(
+            crate::test_helpers::WT_MSTR,
+            crate::test_helpers::USDC,
+            "0x2000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let mut dead_quote = crate::test_helpers::wtmstr_quote("1", "1", "1", "1");
+        dead_quote.success = false;
+        dead_quote.data = None;
+        dead_quote.error = Some(crate::test_helpers::circuit_open_oracle_quote_error());
+        let live_quote = crate::test_helpers::wtmstr_quote("1", "1", "1", "1");
+
+        let result = build_swap_candidates_from_quotes(
+            &[dead_order, live_order],
+            vec![vec![dead_quote], vec![live_quote]],
+            crate::test_helpers::WT_MSTR,
+            crate::test_helpers::USDC,
+            18,
+            6,
+        )
+        .expect("a circuit-open order does not fail the build");
+
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.failures.oracle_unavailable, 1);
+        assert_eq!(result.failures.quote_failed, 0);
+    }
+
+    #[test]
     fn test_invalid_atomic_candidate_does_not_hide_valid_liquidity() {
         let invalid_order = single_pair_order(
             crate::test_helpers::WT_MSTR,
@@ -1159,6 +1192,10 @@ mod tests {
             classify_quote_failure(Some(
                 "Oracle fetch failed for pair (0, 1): HTTP request failed: 404 Not Found"
             )),
+            SwapQuoteFailure::OracleUnavailable
+        );
+        assert_eq!(
+            classify_quote_failure(Some(&crate::test_helpers::circuit_open_oracle_quote_error())),
             SwapQuoteFailure::OracleUnavailable
         );
 

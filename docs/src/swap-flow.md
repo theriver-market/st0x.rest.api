@@ -92,6 +92,13 @@ other orders were quoted, those orders answer: a full fill, an up-to quote with
 for an exact request they cannot fill. `SWAP_NO_LIQUIDITY` means the evaluated
 order set has no executable capacity for the request.
 
+An oracle endpoint that answers HTTP 404, 405 or 410 (or 400 to an
+`allowFailure` batch) three times within 10 minutes, for example a retired
+oracle URL an order still names, is skipped for 15 minutes. Then one probe
+request checks whether it came back. Its orders count as oracle-unavailable
+while it is skipped. Timeouts, connection errors and 5xx responses, such as the
+oracle's off-hours `no_live_quote` 503, never cause an endpoint to be skipped.
+
 ### Understanding Price Limits
 
 `priceCap`, `estimatedIoRatio`, `referenceIoRatio`, and `resolvedPriceCap`

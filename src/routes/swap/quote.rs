@@ -1671,6 +1671,32 @@ mod tests {
         assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
     }
 
+    /// Same incident once the dead oracle's circuit is open: the order is
+    /// skipped without a request and must still lose to the shortfall.
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_shortfall_beats_one_circuit_open_order() {
+        let failure = super::super::classify_quote_failure(Some(
+            &crate::test_helpers::circuit_open_oracle_quote_error(),
+        ));
+        assert_eq!(failure, super::super::SwapQuoteFailure::OracleUnavailable);
+
+        let ds = incident_3a236260_data_source(vec![failure]);
+        let result =
+            process_swap_quote_v2(&ds, incident_3a236260_request(SwapCalldataMode::SpendUpTo))
+                .await
+                .unwrap();
+        assert!(!result.fully_filled);
+        assert_eq!(result.amount, "50");
+        assert_eq!(result.estimated_input, "12");
+        assert_eq!(result.estimated_output, "6");
+
+        let ds = incident_3a236260_data_source(vec![failure]);
+        let result =
+            process_swap_quote_v2(&ds, incident_3a236260_request(SwapCalldataMode::SpendExact))
+                .await;
+        assert_error_code(result, ApiErrorCode::SwapNoLiquidity);
+    }
+
     #[rocket::async_test]
     async fn test_process_swap_quote_v2_every_oracle_unavailable_is_503() {
         let mut ds = candidate_outcome_data_source(

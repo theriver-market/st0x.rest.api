@@ -29,7 +29,9 @@ use alloy::sol_types::{SolCall, SolValue};
 use futures::{stream, StreamExt, TryStreamExt};
 use rain_math_float::Float;
 use rain_orderbook_bindings::IRaindexV6::{takeOrders4Call, OrderV4};
-use rain_orderbook_common::oracle::{encode_oracle_body_batch, fetch_signed_context_batch};
+use rain_orderbook_common::oracle::{
+    encode_oracle_body_batch, fetch_signed_context_batch, OracleError,
+};
 use rain_orderbook_common::raindex_client::take_orders::TakeOrdersRequest;
 use rain_orderbook_common::take_orders::{
     build_take_orders_config_from_simulation, ParsedTakeOrdersMode, TakeOrderCandidate,
@@ -1029,6 +1031,7 @@ async fn refresh_oracle_signed_context(
                     tracing::error!(
                         %error,
                         oracle_request_count = expected_count,
+                        circuit_open = matches!(error, OracleError::CircuitOpen { .. }),
                         "failed to refresh oracle signed context before returning calldata"
                     );
                     ApiError::coded(

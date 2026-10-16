@@ -15,6 +15,18 @@ pub(crate) const USDC: Address = address!("833589fcd6edb6e08f4c7c32d4f71b54bda02
 pub(crate) const WT_MSTR_DUST_ORDER_HASH: B256 =
     b256!("23015e87f07fb96cdf41dfb49861f8bc637b0a03f3c7f96ae3070e3845217315");
 
+/// The quote error an order gets while its oracle endpoint's circuit is open
+/// (endpoint answered 404 repeatedly, e.g. the retired
+/// st0x-oracle-server.fly.dev URL): the raindex quote crate's "Oracle fetch
+/// failed" prefix around `OracleError::CircuitOpen`.
+pub(crate) fn circuit_open_oracle_quote_error() -> String {
+    let error = rain_orderbook_common::oracle::OracleError::CircuitOpen {
+        endpoint: "https://st0x-oracle-server.fly.dev/context".to_string(),
+        retry_in_secs: rain_orderbook_common::oracle::ORACLE_CIRCUIT_COOLDOWN.as_secs(),
+    };
+    format!("Oracle fetch failed for pair (0, 0): {error}")
+}
+
 pub(crate) fn wtmstr_quote(
     max_output: &str,
     max_input: &str,
