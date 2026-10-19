@@ -27,6 +27,17 @@ pub(crate) fn circuit_open_oracle_quote_error() -> String {
     format!("Oracle fetch failed for pair (0, 0): {error}")
 }
 
+/// The quote error an order gets when the stock oracle answers its
+/// `allowFailure` batch item with "no live quote" (outside US trading hours;
+/// prod API log 19 Oct: "no_live_quote: No live quote for wtNVDA.").
+pub(crate) fn no_live_quote_oracle_quote_error() -> String {
+    let error = rain_orderbook_common::oracle::OracleBatchItemError {
+        error: "no_live_quote".to_string(),
+        detail: "No live quote for wtNVDA.".to_string(),
+    };
+    format!("Oracle fetch failed for pair (0, 0): {error}")
+}
+
 pub(crate) fn wtmstr_quote(
     max_output: &str,
     max_input: &str,

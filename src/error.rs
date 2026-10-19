@@ -22,6 +22,7 @@ pub enum ApiErrorCode {
     SwapSameToken,
     SwapNoLiquidity,
     SwapOracleUnavailable,
+    SwapMarketClosed,
     SwapQuoteFailed,
     SwapTimeout,
     SwapPreflightFailed,
@@ -46,6 +47,7 @@ impl ApiErrorCode {
             Self::SwapSameToken => "SWAP_SAME_TOKEN",
             Self::SwapNoLiquidity => "SWAP_NO_LIQUIDITY",
             Self::SwapOracleUnavailable => "SWAP_ORACLE_UNAVAILABLE",
+            Self::SwapMarketClosed => "SWAP_MARKET_CLOSED",
             Self::SwapQuoteFailed => "SWAP_QUOTE_FAILED",
             Self::SwapTimeout => "SWAP_TIMEOUT",
             Self::SwapPreflightFailed => "SWAP_PREFLIGHT_FAILED",
@@ -65,6 +67,10 @@ impl ApiErrorCode {
             Self::UnprocessableEntity => Status::UnprocessableEntity,
             Self::Unauthorized => Status::Unauthorized,
             Self::Forbidden => Status::Forbidden,
+            // An expected state (the stock oracle has no price outside US
+            // trading hours), not an outage: the request conflicts with the
+            // market's current state and succeeds unchanged once it reopens.
+            Self::SwapMarketClosed => Status::Conflict,
             Self::NotFound | Self::SwapNoLiquidity => Status::NotFound,
             Self::RateLimited => Status::TooManyRequests,
             Self::NotYetIndexed => Status::Accepted,
@@ -90,6 +96,11 @@ pub struct ApiErrorDetail {
     pub code: ApiErrorCode,
     #[schema(example = "Something went wrong")]
     pub message: String,
+    /// For SWAP_MARKET_CLOSED: when the stock oracle's session next opens
+    /// (RFC 3339, UTC). Omitted for every other error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "2026-10-19T08:00:00Z")]
+    pub next_open: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -115,6 +126,9 @@ pub enum ApiError {
     RateLimited(String),
     #[error("Not yet indexed: {0}")]
     NotYetIndexed(String),
+    /// The stock oracle answered "no live quote" while the US session is shut.
+    #[error("market closed (next open {next_open:?})")]
+    MarketClosed { next_open: Option<String> },
     #[error("{code}: {public_message}")]
     Coded {
         code: ApiErrorCode,
@@ -144,6 +158,7 @@ impl ApiError {
             ApiError::Internal(_) => ApiErrorCode::InternalError,
             ApiError::RateLimited(_) => ApiErrorCode::RateLimited,
             ApiError::NotYetIndexed(_) => ApiErrorCode::NotYetIndexed,
+            ApiError::MarketClosed { .. } => ApiErrorCode::SwapMarketClosed,
             ApiError::Coded { code, .. } => *code,
         }
     }
@@ -160,10 +175,22 @@ impl ApiError {
             | ApiError::Internal(msg)
             | ApiError::RateLimited(msg)
             | ApiError::NotYetIndexed(msg) => msg.clone(),
+            ApiError::MarketClosed { .. } => MARKET_CLOSED_MESSAGE.to_string(),
             ApiError::Coded { public_message, .. } => (*public_message).to_string(),
         }
     }
+
+    /// When the market next opens, for a market-closed answer.
+    pub fn next_open(&self) -> Option<String> {
+        match self {
+            ApiError::MarketClosed { next_open } => next_open.clone(),
+            _ => None,
+        }
+    }
 }
+
+pub(crate) const MARKET_CLOSED_MESSAGE: &str =
+    "the US stock market is closed, so this swap has no live price until it reopens";
 
 impl ApiErrorResponse {
     pub(crate) fn from_error(request_id: String, error: &ApiError) -> Self {
@@ -172,6 +199,7 @@ impl ApiErrorResponse {
             error: ApiErrorDetail {
                 code: error.code(),
                 message: error.public_message(),
+                next_open: error.next_open(),
             },
         }
     }
@@ -257,11 +285,33 @@ mod tests {
         ))
     }
 
+    #[get("/market-closed")]
+    fn market_closed() -> Result<(), ApiError> {
+        Err(ApiError::MarketClosed {
+            next_open: Some("2026-10-19T08:00:00Z".to_string()),
+        })
+    }
+    #[get("/oracle-unavailable")]
+    fn oracle_unavailable() -> Result<(), ApiError> {
+        Err(ApiError::coded(
+            ApiErrorCode::SwapOracleUnavailable,
+            "the oracle required to evaluate this swap is temporarily unavailable",
+        ))
+    }
+
     fn error_client() -> Client {
         let rocket = rocket::build()
             .mount(
                 "/",
-                rocket::routes![bad_request, unauthorized, not_found, internal, coded],
+                rocket::routes![
+                    bad_request,
+                    unauthorized,
+                    not_found,
+                    internal,
+                    coded,
+                    market_closed,
+                    oracle_unavailable
+                ],
             )
             .attach(RequestLogger);
         Client::tracked(rocket).expect("valid rocket instance")
@@ -286,6 +336,41 @@ mod tests {
         assert_eq!(body["request_id"], request_id);
         assert_eq!(body["error"]["code"], expected_code);
         assert_eq!(body["error"]["message"], expected_message);
+    }
+
+    #[test]
+    fn test_market_closed_returns_409_with_next_open() {
+        let client = error_client();
+        assert_error_response(
+            &client,
+            "/market-closed",
+            409,
+            "SWAP_MARKET_CLOSED",
+            MARKET_CLOSED_MESSAGE,
+        );
+        let body: serde_json::Value = serde_json::from_str(
+            &client
+                .get("/market-closed")
+                .dispatch()
+                .into_string()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["next_open"], "2026-10-19T08:00:00Z");
+    }
+
+    #[test]
+    fn test_oracle_unavailable_body_is_unchanged() {
+        let client = error_client();
+        let response = client.get("/oracle-unavailable").dispatch();
+        assert_eq!(response.status().code, 503);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().unwrap()).unwrap();
+        let error = body["error"].as_object().expect("error object");
+        assert_eq!(error["code"], "SWAP_ORACLE_UNAVAILABLE");
+        let mut keys: Vec<&str> = error.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["code", "message"]);
     }
 
     #[test]
@@ -357,6 +442,7 @@ mod tests {
     fn test_catalog_serializes_stable_codes() {
         let cases = [
             (ApiErrorCode::BadRequest, "\"BAD_REQUEST\""),
+            (ApiErrorCode::SwapMarketClosed, "\"SWAP_MARKET_CLOSED\""),
             (ApiErrorCode::SwapQuoteFailed, "\"SWAP_QUOTE_FAILED\""),
             (ApiErrorCode::SwapTimeout, "\"SWAP_TIMEOUT\""),
             (ApiErrorCode::SwapSameToken, "\"SWAP_SAME_TOKEN\""),
@@ -382,6 +468,7 @@ mod tests {
                 ApiErrorCode::SwapOracleUnavailable,
                 Status::ServiceUnavailable,
             ),
+            (ApiErrorCode::SwapMarketClosed, Status::Conflict),
             (ApiErrorCode::SwapQuoteFailed, Status::InternalServerError),
             (ApiErrorCode::SwapTimeout, Status::GatewayTimeout),
             (

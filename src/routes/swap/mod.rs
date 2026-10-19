@@ -107,16 +107,24 @@ async fn capture_swap_outcome<T>(
 }
 
 const ORACLE_FETCH_FAILURE_PREFIX: &str = "Oracle fetch failed for pair (";
+/// The stable code the stock oracle gives an `allowFailure` batch item when it
+/// has no live price (raindex `OracleBatchItemError` shown as "code: detail",
+/// e.g. "no_live_quote: No live quote for wtNVDA."). The oracle answered, so
+/// this is not an outage; outside US trading hours it means "market closed".
+const ORACLE_NO_LIVE_QUOTE_CODE: &str = "no_live_quote:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SwapQuoteFailure {
     OracleUnavailable,
+    /// The oracle answered but had no live price for the pair.
+    OracleNoLiveQuote,
     QuoteFailed,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SwapQuoteFailures {
     oracle_unavailable: usize,
+    oracle_no_live_quote: usize,
     quote_failed: usize,
 }
 
@@ -124,16 +132,42 @@ impl SwapQuoteFailures {
     fn record(&mut self, failure: SwapQuoteFailure) {
         match failure {
             SwapQuoteFailure::OracleUnavailable => self.oracle_unavailable += 1,
+            SwapQuoteFailure::OracleNoLiveQuote => self.oracle_no_live_quote += 1,
             SwapQuoteFailure::QuoteFailed => self.quote_failed += 1,
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.oracle_unavailable == 0 && self.quote_failed == 0
+        self.oracle_unavailable == 0 && self.oracle_no_live_quote == 0 && self.quote_failed == 0
     }
 
-    pub(crate) fn oracle_unavailable_error(&self) -> Option<ApiError> {
-        (self.oracle_unavailable > 0).then(|| {
+    /// The answer when no order could be quoted and an oracle was the reason.
+    pub(crate) fn oracle_error(&self) -> Option<ApiError> {
+        self.oracle_error_at(time::OffsetDateTime::now_utc())
+    }
+
+    /// Market closed (409 SWAP_MARKET_CLOSED) only when the oracle itself said
+    /// "no live quote" for at least one order AND the US calendar says its
+    /// session is shut at `now`. Anything else an oracle caused (no answer,
+    /// circuit open, bad response, expired quote, or "no live quote" while the
+    /// session should be open) stays 503 SWAP_ORACLE_UNAVAILABLE. Other orders
+    /// failing on a dead oracle URL at night don't change the answer: the live
+    /// oracle has confirmed the market is shut, and no order can fill then.
+    pub(crate) fn oracle_error_at(&self, now: time::OffsetDateTime) -> Option<ApiError> {
+        if self.oracle_no_live_quote > 0
+            && crate::us_market::oracle_session_closed(now) == Some(true)
+        {
+            let next_open =
+                crate::us_market::next_oracle_open(now).map(crate::us_market::rfc3339_utc);
+            tracing::info!(
+                oracle_no_live_quote_count = self.oracle_no_live_quote,
+                oracle_unavailable_count = self.oracle_unavailable,
+                next_open = next_open.as_deref().unwrap_or("unknown"),
+                "swap answered market closed"
+            );
+            return Some(ApiError::MarketClosed { next_open });
+        }
+        (self.oracle_unavailable > 0 || self.oracle_no_live_quote > 0).then(|| {
             ApiError::coded(
                 ApiErrorCode::SwapOracleUnavailable,
                 "the oracle required to evaluate this swap is temporarily unavailable",
@@ -159,11 +193,19 @@ pub(crate) struct SwapCandidateBuild {
 }
 
 fn classify_quote_failure(error: Option<&str>) -> SwapQuoteFailure {
-    match error {
-        Some(error) if error.starts_with(ORACLE_FETCH_FAILURE_PREFIX) => {
-            SwapQuoteFailure::OracleUnavailable
-        }
-        _ => SwapQuoteFailure::QuoteFailed,
+    let Some(oracle_error) =
+        error.and_then(|error| error.strip_prefix(ORACLE_FETCH_FAILURE_PREFIX))
+    else {
+        return SwapQuoteFailure::QuoteFailed;
+    };
+    // "<input>, <output>): <oracle error>"
+    let reason = oracle_error
+        .split_once("): ")
+        .map_or("", |(_, reason)| reason);
+    if reason.starts_with(ORACLE_NO_LIVE_QUOTE_CODE) {
+        SwapQuoteFailure::OracleNoLiveQuote
+    } else {
+        SwapQuoteFailure::OracleUnavailable
     }
 }
 
@@ -290,6 +332,7 @@ fn build_swap_candidates_from_quotes(
         order_count = orders.len(),
         candidate_count = result.candidates.len(),
         oracle_unavailable_count = result.failures.oracle_unavailable,
+        oracle_no_live_quote_count = result.failures.oracle_no_live_quote,
         quote_failure_count = result.failures.quote_failed,
         non_executable_atomic_count,
         input_token = %input_token,
@@ -1184,6 +1227,113 @@ mod tests {
         );
         assert_eq!(response.data.as_ref(), [0xab, 0xcd, 0xef]);
         assert!(response.approvals.is_empty());
+    }
+
+    #[test]
+    fn test_no_live_quote_is_classified_apart_from_oracle_outages() {
+        let no_live_quote = crate::test_helpers::no_live_quote_oracle_quote_error();
+        assert_eq!(
+            no_live_quote,
+            "Oracle fetch failed for pair (0, 0): no_live_quote: No live quote for wtNVDA."
+        );
+        assert_eq!(
+            classify_quote_failure(Some(&no_live_quote)),
+            SwapQuoteFailure::OracleNoLiveQuote
+        );
+        for outage in [
+            "Oracle fetch failed for pair (0, 0): expired_quote: Quote for wtNVDA expired at 1792157400000 (checked at 1792157402701).",
+            "Oracle fetch failed for pair (0, 0): HTTP request to https://oracle.example/context failed: HTTP status server error (503 Service Unavailable)",
+            "Oracle fetch failed for pair (0, 0): Missing oracle response slot",
+            // The code must lead the oracle error, not appear inside another one.
+            "Oracle fetch failed for pair (0, 0): Invalid oracle response: no_live_quote: x",
+        ] {
+            assert_eq!(
+                classify_quote_failure(Some(outage)),
+                SwapQuoteFailure::OracleUnavailable,
+                "{outage}"
+            );
+        }
+        assert_eq!(
+            classify_quote_failure(Some("no_live_quote: No live quote for wtNVDA.")),
+            SwapQuoteFailure::QuoteFailed
+        );
+    }
+
+    #[test]
+    fn test_no_live_quote_while_closed_is_market_closed_with_next_open() {
+        use time::macros::datetime;
+        let failures: super::SwapQuoteFailures =
+            [SwapQuoteFailure::OracleNoLiveQuote].into_iter().collect();
+        // Mon 19 Oct 2026 05:30 UTC = 01:30 EDT.
+        let error = failures
+            .oracle_error_at(datetime!(2026-10-19 05:30 UTC))
+            .expect("an oracle answer");
+        assert_eq!(error.code(), ApiErrorCode::SwapMarketClosed);
+        assert_eq!(error.code().status(), rocket::http::Status::Conflict);
+        assert_eq!(error.next_open().as_deref(), Some("2026-10-19T08:00:00Z"));
+        // Saturday -> Monday 04:00 EDT.
+        let error = failures
+            .oracle_error_at(datetime!(2026-10-17 15:00 UTC))
+            .expect("an oracle answer");
+        assert_eq!(error.next_open().as_deref(), Some("2026-10-19T08:00:00Z"));
+    }
+
+    #[test]
+    fn test_no_live_quote_while_open_stays_oracle_unavailable() {
+        use time::macros::datetime;
+        let failures: super::SwapQuoteFailures =
+            [SwapQuoteFailure::OracleNoLiveQuote].into_iter().collect();
+        // Fri 16 Oct 2026 15:00 UTC: regular session (wtMC answered no_live_quote then).
+        let error = failures
+            .oracle_error_at(datetime!(2026-10-16 15:00 UTC))
+            .expect("an oracle answer");
+        assert_eq!(error.code(), ApiErrorCode::SwapOracleUnavailable);
+        assert_eq!(error.next_open(), None);
+    }
+
+    #[test]
+    fn test_oracle_outage_while_closed_stays_oracle_unavailable() {
+        use time::macros::datetime;
+        // Oracle down at night: nothing confirms the market is the reason.
+        let failures: super::SwapQuoteFailures = [SwapQuoteFailure::OracleUnavailable; 3]
+            .into_iter()
+            .collect();
+        let error = failures
+            .oracle_error_at(datetime!(2026-10-19 05:30 UTC))
+            .expect("an oracle answer");
+        assert_eq!(error.code(), ApiErrorCode::SwapOracleUnavailable);
+        assert_eq!(
+            error.code().status(),
+            rocket::http::Status::ServiceUnavailable
+        );
+    }
+
+    #[test]
+    fn test_live_oracle_closed_beside_dead_oracle_url_is_market_closed() {
+        use time::macros::datetime;
+        // 19 Oct night: wtNVDA orders on the live oracle say no_live_quote while
+        // one order sits on the retired URL with its circuit open.
+        let failures: super::SwapQuoteFailures = [
+            SwapQuoteFailure::OracleNoLiveQuote,
+            SwapQuoteFailure::OracleUnavailable,
+            SwapQuoteFailure::OracleNoLiveQuote,
+        ]
+        .into_iter()
+        .collect();
+        let error = failures
+            .oracle_error_at(datetime!(2026-10-19 03:00 UTC))
+            .expect("an oracle answer");
+        assert_eq!(error.code(), ApiErrorCode::SwapMarketClosed);
+    }
+
+    #[test]
+    fn test_no_oracle_failure_gives_no_oracle_error() {
+        use time::macros::datetime;
+        let failures: super::SwapQuoteFailures =
+            [SwapQuoteFailure::QuoteFailed].into_iter().collect();
+        assert!(failures
+            .oracle_error_at(datetime!(2026-10-19 03:00 UTC))
+            .is_none());
     }
 
     #[test]

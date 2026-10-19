@@ -18,6 +18,7 @@ pub fn bad_request(req: &Request<'_>) -> Json<ApiErrorResponse> {
         error: ApiErrorDetail {
             code: ApiErrorCode::BadRequest,
             message: "The request was invalid or malformed".to_string(),
+            next_open: None,
         },
     })
 }
@@ -32,6 +33,7 @@ pub fn unauthorized(req: &Request<'_>) -> Json<ApiErrorResponse> {
         error: ApiErrorDetail {
             code: ApiErrorCode::Unauthorized,
             message: "Missing or invalid credentials".to_string(),
+            next_open: None,
         },
     })
 }
@@ -46,6 +48,7 @@ pub fn forbidden(req: &Request<'_>) -> Json<ApiErrorResponse> {
         error: ApiErrorDetail {
             code: ApiErrorCode::Forbidden,
             message: "Insufficient permissions".to_string(),
+            next_open: None,
         },
     })
 }
@@ -60,6 +63,7 @@ pub fn not_found(req: &Request<'_>) -> Json<ApiErrorResponse> {
         error: ApiErrorDetail {
             code: ApiErrorCode::NotFound,
             message: "The requested resource was not found".to_string(),
+            next_open: None,
         },
     })
 }
@@ -74,6 +78,7 @@ pub fn unprocessable_entity(req: &Request<'_>) -> Json<ApiErrorResponse> {
         error: ApiErrorDetail {
             code: ApiErrorCode::UnprocessableEntity,
             message: "Request body could not be parsed".to_string(),
+            next_open: None,
         },
     })
 }
@@ -98,6 +103,7 @@ pub fn too_many_requests(req: &Request<'_>) -> RateLimitedResponse {
         error: ApiErrorDetail {
             code: ApiErrorCode::RateLimited,
             message: "Too many requests, please try again later".to_string(),
+            next_open: None,
         },
     }))
 }
@@ -112,6 +118,7 @@ pub fn internal_server_error(req: &Request<'_>) -> Json<ApiErrorResponse> {
         error: ApiErrorDetail {
             code: ApiErrorCode::InternalError,
             message: "Internal server error".to_string(),
+            next_open: None,
         },
     })
 }

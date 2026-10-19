@@ -59,6 +59,7 @@ const ORACLE_REFRESH_CONCURRENCY_LIMIT: usize = 8;
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
+        (status = 409, description = "US stock market closed: the oracle has no live price (SWAP_MARKET_CLOSED, error.next_open)", body = ApiErrorResponse),
         (status = 503, description = "Required upstream or swap oracle unavailable", body = ApiErrorResponse),
         (status = 504, description = "Swap request timed out", body = ApiErrorResponse),
     )
@@ -155,6 +156,7 @@ pub async fn post_swap_calldata(
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
+        (status = 409, description = "US stock market closed: the oracle has no live price (SWAP_MARKET_CLOSED, error.next_open)", body = ApiErrorResponse),
         (status = 503, description = "Required upstream or swap oracle unavailable", body = ApiErrorResponse),
         (status = 504, description = "Swap request timed out", body = ApiErrorResponse),
     )
@@ -612,9 +614,7 @@ async fn build_calldata_candidates(
     // Executable candidates win in a mixed book: an order whose oracle can't be
     // fetched can't be taken, so it can't make the user's price worse.
     if candidates.is_empty() {
-        return Err(failures
-            .oracle_unavailable_error()
-            .unwrap_or_else(no_liquidity_error));
+        return Err(failures.oracle_error().unwrap_or_else(no_liquidity_error));
     }
     Ok((candidates, own_order_count))
 }

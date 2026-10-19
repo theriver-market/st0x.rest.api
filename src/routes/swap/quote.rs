@@ -53,6 +53,7 @@ const FULL_FILL_RELATIVE_TOLERANCE: Float = Float::from_raw(fixed_bytes!(
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
+        (status = 409, description = "US stock market closed: the oracle has no live price (SWAP_MARKET_CLOSED, error.next_open)", body = ApiErrorResponse),
         (status = 503, description = "Required swap oracle unavailable", body = ApiErrorResponse),
         (status = 504, description = "Swap request timed out", body = ApiErrorResponse),
     )
@@ -140,6 +141,7 @@ pub async fn post_swap_quote(
         (status = 429, description = "Rate limited", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
         (status = 502, description = "Order source unavailable", body = ApiErrorResponse),
+        (status = 409, description = "US stock market closed: the oracle has no live price (SWAP_MARKET_CLOSED, error.next_open)", body = ApiErrorResponse),
         (status = 503, description = "Required swap oracle unavailable", body = ApiErrorResponse),
         (status = 504, description = "Swap request timed out", body = ApiErrorResponse),
     )
@@ -307,9 +309,7 @@ async fn process_swap_quote(
         .map_err(|error| map_quote_boundary_error(error, ApiErrorCode::SwapQuoteFailed))?;
 
     if candidates.is_empty() {
-        return Err(failures
-            .oracle_unavailable_error()
-            .unwrap_or_else(no_liquidity_error));
+        return Err(failures.oracle_error().unwrap_or_else(no_liquidity_error));
     }
 
     let buy_target = Float::parse(req.output_amount.clone()).map_err(|e| {
@@ -437,9 +437,7 @@ pub(super) async fn process_swap_quote_v2(
     // 3a236260: a $10k NVDA buy with $2,242 on offer and 1 of 4 orders on a
     // retired oracle URL answered 503 SWAP_ORACLE_UNAVAILABLE).
     if candidates.is_empty() {
-        return Err(failures
-            .oracle_unavailable_error()
-            .unwrap_or_else(no_liquidity_error));
+        return Err(failures.oracle_error().unwrap_or_else(no_liquidity_error));
     }
 
     let price_cap = match price_limit {
@@ -1535,6 +1533,44 @@ mod tests {
         let result = process_swap_quote(&ds, quote_request("100")).await;
 
         assert_error_code(result, ApiErrorCode::SwapOracleUnavailable);
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_no_live_quote_is_closed_or_unavailable_never_quoted() {
+        let mut ds = candidate_outcome_data_source(
+            Vec::new(),
+            vec![super::super::SwapQuoteFailure::OracleNoLiveQuote; 2],
+        );
+        ds.base.orders = Ok(vec![mock_order(), mock_order()]);
+        let expected = match crate::us_market::oracle_session_closed(time::OffsetDateTime::now_utc())
+        {
+            Some(true) => ApiErrorCode::SwapMarketClosed,
+            _ => ApiErrorCode::SwapOracleUnavailable,
+        };
+
+        for mode in [SwapCalldataMode::SpendUpTo, SwapCalldataMode::SpendExact] {
+            let result = process_swap_quote_v2(&ds, incident_3a236260_request(mode)).await;
+            let Err(error) = result else {
+                panic!("no live oracle price must not quote");
+            };
+            assert_eq!(error.code(), expected);
+            assert_eq!(
+                error.next_open().is_some(),
+                expected == ApiErrorCode::SwapMarketClosed
+            );
+        }
+    }
+
+    #[rocket::async_test]
+    async fn test_process_swap_quote_v2_quotes_live_orders_beside_no_live_quote() {
+        let ds = candidate_outcome_data_source(
+            vec![mock_candidate("1000", "1.5")],
+            vec![super::super::SwapQuoteFailure::OracleNoLiveQuote],
+        );
+
+        let result = process_swap_quote(&ds, quote_request("100")).await;
+
+        assert!(result.is_ok(), "executable orders still answer");
     }
 
     #[rocket::async_test]

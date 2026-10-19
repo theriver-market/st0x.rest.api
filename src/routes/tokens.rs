@@ -839,6 +839,7 @@ pub(super) fn api_error_message(error: &ApiError) -> String {
         | ApiError::Internal(message)
         | ApiError::RateLimited(message)
         | ApiError::NotYetIndexed(message) => message.clone(),
+        ApiError::MarketClosed { .. } => crate::error::MARKET_CLOSED_MESSAGE.to_string(),
         ApiError::Coded { public_message, .. } => (*public_message).to_string(),
     }
 }

@@ -26,6 +26,7 @@ mod swap_capacity;
 mod take_simulation;
 mod telemetry;
 mod types;
+mod us_market;
 mod wrap_ratio;
 
 #[cfg(test)]
